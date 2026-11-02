@@ -17,7 +17,14 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
 from collector.helper import PhaseClock
+from collector.sglang.runtime_limits import (
+    kv_pool_capacity_tokens,
+    kv_pool_page_size,
+    required_kv_alloc_tokens,
+    required_prefill_extend_tokens,
+)
 
 pytestmark = pytest.mark.unit
 SOURCE = Path(__file__).resolve().parents[4] / "collector/sglang/collect_mla_module.py"
@@ -147,7 +154,13 @@ def runtime(monkeypatch):
         return True
 
     loaded = _load(
-        ["MeasurementBoundaryError", "PerfLogWriteError", "_run_prefill", "run_attention_torch"],
+        [
+            "MeasurementBoundaryError",
+            "PerfLogWriteError",
+            "_validate_prefill_capacity",
+            "_run_prefill",
+            "run_attention_torch",
+        ],
         {
             "torch": torch,
             "json": json,
@@ -159,6 +172,10 @@ def runtime(monkeypatch):
             "_validate_dsa_forward_tokens": lambda *_: None,
             "_initialize_dsa_history": record("history"),
             "_runtime_chunk_size": lambda _: 8192,
+            "_kv_pool_capacity_tokens": kv_pool_capacity_tokens,
+            "kv_pool_page_size": kv_pool_page_size,
+            "required_kv_alloc_tokens": required_kv_alloc_tokens,
+            "required_prefill_extend_tokens": required_prefill_extend_tokens,
             "_dsa_skip_indexer_enabled": lambda *_: False,
             "_resolve_perf_path": lambda _path, filename: filename,
             "_module_model_architecture": lambda _: "GlmMoeDsaForCausalLM",

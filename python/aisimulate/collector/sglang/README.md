@@ -85,7 +85,7 @@ capacity from the largest planned query-token batch. This permits full-history
 module forwards beyond the default serving chunk; an explicit chunk override
 still takes precedence. DSA context also sizes its default chunk from the
 planned query batch and uses an explicit 0.90 static-memory fraction, avoiding
-the native serving heuristic that would reserve 192 GiB for a 131K chunk.
+the native serving heuristic that would reserve 192 GiB for a 128K (131,072-token) chunk.
 The requested pool and per-point capacity validation remain independent;
 generation keeps its native default configuration. Chunk/pool violations
 raise visible failures rather than dropping planned context points.

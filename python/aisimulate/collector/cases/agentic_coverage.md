@@ -327,7 +327,7 @@ Estimate incremental collection time as:
 - All time terms are seconds. `ΔT_setup_groups` charges additional worker/model-group initialization once per group, not once per inner shape.
 - Deduplicate shared physical geometry and include old anchors made eligible by a larger budget. For example, B4 at the existing 262,144 anchor contributes cost even though the anchor itself is unchanged.
 
-A structural census using the [existing getter test harness](../../tests/unit/collector/test_dense_attention_agentic.py) comparing the previous defaults with the enabled defaults produced the following result for a shared 1M cap plus 64K/128K/512K/1M anchors:
+A structural census using the [actual getter test harness](../../tests/unit/collector/test_dense_attention_agentic.py), comparing defaults at commit `36a69a683c60081e61d6379f868b1c7257e1a41e` with the enabled defaults, produced the following result for a shared 1M cap plus 64K/128K/512K/1M anchors:
 
 | Backend | Previous cases | Enabled cases | Additional cases | Optional 786,432 adds |
 |---|---:|---:|---:|---:|
@@ -347,7 +347,19 @@ The ordinary-MoE actual-getter census on mocked SM103 expands inner token cells 
 | SGLang | 7,503 | 202,581 | 217,587 | 15,006 |
 | TRT-LLM | 11,385 | 307,395 | 330,165 | 22,770 |
 
-Each group changes from 27 to 29 token anchors: **7.41% more cells**, but the sum of token counts is **2.70×** the old sum. That ratio is a linear-work proxy, not elapsed runtime; routing, native chunking, autotuning and failures matter. Kimi KDA verification changes from **108 to 216 cells per backend**, with the 12 geometry/precision groups unchanged; all-phase KDA cells change from 600 to 708. The NCCL range adds one size per collective/dtype/topology combination: the local 4-collective × 2-dtype × 3-topology driver adds **24 measurements**, with native warmup/startup charged for each. None of these counts establishes GPU feasibility.
+Each group changes from 27 to 29 token anchors: **7.41% more cells**, but the sum of token counts is **2.70×** the old sum. That ratio is a linear-work proxy, not elapsed runtime; routing, native chunking, autotuning and failures matter. Kimi KDA verification changes from **108 to 216 cells per backend**, with the 12 geometry/precision groups unchanged; all-phase KDA cells change from 600 to 708. The NCCL range adds one size per collective/dtype/topology combination: the eight-GPU local 4-collective × 2-dtype × 3-topology driver adds **24 measurements**, with native warmup/startup charged for each. None of these counts establishes GPU feasibility.
+
+The module census compares the same baseline with enabled defaults without adding head/model/precision setup axes:
+
+| Module scope | Previous inner cases | Enabled inner cases | Additional |
+|---|---:|---:|---:|
+| vLLM DSA context, one BF16 precision across all declared local heads, before model/memory constraints | 21,792 | 25,368 | 3,576 |
+| SGLang DSA context worker, one head/precision/1M-model group, retaining index cap and using an unlimited test pool | 2,501 | 3,275 | 774 |
+| SGLang MSA context, one head/precision/1M-model group, before memory admission | 3,500 | 3,584 | 84 |
+| SGLang MSA generation, same group | 239 | 256 | 17 |
+| SGLang GLM DSA generation, heads 8 / FP8 KV / BF16 projections, before memory admission | 250 | 267 | 17 |
+
+The DSA worker comparison includes replacing the previous implicit 16K Blackwell chunk with manifest-sized capacity; it is not just a YAML length count. All old shapes survive these structural comparisons. GLM full/skip-indexer rows would increase from 500 to 534 for that selected manifest; existing 500-row measurements stay valid and unchanged. No fixed seconds-per-point estimate is established for these module grids. The native examples below show that long-prefix preparation and warmup can dominate; a 0.1–1 second assumption would understate the measured new SGLang context probes. Do not add counts across unlike scopes or count shared shapes twice.
 
 Earlier measured campaigns provide limited context: 95 Qwen B300/vLLM prefill rows took **52.751 seconds** collector time (18 added anchors were not timed separately); 500 GLM B300/SGLang rows took **1.213 GPU-hours**, with about **30.1 minutes per group** attributed to its 96 added shapes, mostly history seeding. This is within-run attribution, not a controlled before/after comparison. These older campaigns do not qualify the newly enabled sizes.
 
@@ -356,6 +368,31 @@ For otherwise identical B1 full-prefill cases, increasing S from 262,144 to 1,04
 `(1,048,576 / 262,144)^2 = 4^2 = 16`.
 
 **4** is the length ratio; **16** is a compute-work ratio, not measured time. More generally dense work scales approximately as `B × h_q × d × S²`. A constant B×S token budget therefore does not bound compute cost. Real cached-prefix forwards may compute far fewer queries than full-prefill calibration. Targeted joint-shape collection and a future prefix-aware dense measurement contract can reduce unnecessary work; they do not justify removing feasible large shapes.
+
+### B300 native qualification
+
+The following bounded checks used signed collector commit `f7cd581b0005e9084ef51dc2e330d941fc00fdd4` on NVIDIA B300 SXM6 AC (SM103, 287,428,640,768 bytes). They execute unchanged native collector code. Dense and ordinary-MoE probes select actual generated cases; module probes execute explicit joint shapes with model-position validation. The separate generator census establishes grid membership and preservation, while native probes establish execution for only their selected shapes. Smoke rows and provenance remain local and are not packaged timing data. Native-call wall time includes collector initialization/warmup; it is distinct from the logged per-forward latency and from allocation time.
+
+| Native collector | Qualified shape | Native-call wall time |
+|---|---|---:|
+| vLLM 0.31.0 dense context | B1, S1M, Q4/KV4, d128, BF16 | 10.780 s |
+| SGLang 0.5.21 dense context | Same | 21.632 s |
+| TRT-LLM 1.3.0rc29 dense context | Same | 25.017 s |
+| vLLM / SGLang / TRT-LLM dense context | B4, S262,144, Q4/KV1, d128, BF16 | 2.917 / 5.985 / 7.066 s |
+| TRT-LLM standalone MLA context | B1, S1M, one local head, BF16 | 8.617 s |
+| TRT-LLM standalone MLA generation | B1, past 1,048,575, 16 local heads, BF16 / FP8 KV | 2.808 / 10.777 s |
+| TRT-LLM ordinary MoE | GLM geometry H6,144 / I2,048 / E256 / top-k8, TP4/EP1, NVFP4, grouped 16K/32K/64K tokens | 27.833 s for all three counts |
+| NCCL 2.30.7, four B300 GPUs | All-gather/reduce-scatter × half/int8 × 512 MiB/1 GiB gathered payload | 29.979 s for eight native measurements |
+
+The nine dense/standalone probes passed in **6 min 17 s summed one-GPU allocation time**, including startup. The standalone 1M MLA context peak allocation was 5,813,575,168 bytes, about 40.2 MiB above its visible-buffer estimate; it remained comfortably within the device headroom. Admission estimates are not exact peak guarantees. TRT MoE produced all three rows (2.668/5.094/9.665 ms per forward), with 27.59 GiB peak allocated memory. Its full process took 38.263 s and its one-GPU allocation 96 s. The NCCL harness took 31.580 s including setup; its four-GPU allocation lasted 119 s. These are measured probe costs, not the incremental cost of a full sweep.
+
+SGLang DSA prefill checks at prefix 262,144 and q32,768 passed at B1 and B4 (32K/128K aggregate new tokens). Within the loaded runner, point preparation/timing took **5.01/10.43 s**; logged forward latencies were **76.859/332.651 ms**. SGLang MSA at the same prefix/query and B1 took **33.89 s**, including **32.97 s eager warmup/JIT** and a **0.16 s timed loop** (15.936 ms per forward). vLLM 0.30.0 DSA passed B1×32K and B2×16K queries at that prefix, producing both full- and reused-indexer rows. Do not multiply cold process startup by every inner shape when estimating grouped collection.
+
+SGLang generation also passed **DSA B32 at past 1,048,575** and **MSA B1 at past 917,504**. The DSA loaded-runner point took **75.43 s**, including **70.91 s history initialization**, while the timed decode was only **0.7897 ms**. The MSA point took **32.96 s**, including **31.89 s eager warmup/JIT**. All seven module probes passed and produced nine rows (seven full-index/module rows plus two vLLM reused-indexer rows). These costs explain why added long-history cells cannot be estimated from decode latency alone.
+
+vLLM 0.31.0 Kimi KDA passed **B1/B8 × widths 3/5/6** at the TP8 geometry (12 heads × 128 dimensions), producing **12 rows**: native `causal_conv1d_update` plus `fused_recurrent_kda` for each of six cells. Native collection took **21.489 s** for all six cells; the full process took **23.310 s** and the one-GPU allocation **65 s**. This qualifies those widths and geometry, not every state layout or parallel topology.
+
+SGLang 0.5.21 Kimi KDA attempted B1/B8 × widths 3/5/6 and produced **zero rows**: that pinned image lacks `sglang.kernels.ops.kimi_k3`. This is a runtime package/collector compatibility gap, not evidence that the new widths are infeasible. No replacement kernels or fabricated measurements were used. Full grids, other GPUs, numerical correctness, exact served checkpoints and end-to-end prediction accuracy remain unqualified; range expansion alone does not establish any of them.
 
 Qualification order:
 

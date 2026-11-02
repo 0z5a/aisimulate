@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from collector.module_memory import standalone_mla_footprint_bytes
 
 pytestmark = pytest.mark.unit

@@ -795,15 +795,18 @@ per-rank head count. Python callers pass the actual per-rank head count and
 on `run_mla_module()` or `run_mla_module_worker()`, to reproduce a serving
 chunk limit of 16,384 tokens. The worker forwards the limit into its subprocess.
 Explicit limits must be positive for one-shot module collection.
-Omitting the option keeps SGLang's default. The existing
-wide-EP and DSA paths keep their separate behavior. The ordinary context table
+Without an explicit override, generated MLA prefill manifests and DSA
+prefill grids size native chunk capacity from their largest planned query
+batch; ordinary direct calls without a manifest keep the serving default.
+Wide-EP remains separate. The ordinary context table
 uses the existing consumer schema; this does not add mixed-precision modeling.
 
 ## TRT-LLM MoE autotuning failures
 
-TRT-LLM MoE collection requires either a loaded tactic cache or at least one
-successful autotuning attempt before measuring a tuning-enabled case. Ordinary
-failures may try smaller eligible token counts; if every attempt fails, the
-case raises before timing or publishing rows. CUDA accelerator errors propagate
-immediately. The successful collection path and historical profile values are
-unchanged by this failure guard.
+TRT-LLM ordinary MoE dry-runs the largest requested token count. Without a
+loaded tactic cache, every requested tuning point must succeed before
+measurement. Dry-run, tuning and execution failures propagate; the collector
+does not retry smaller counts to shrink the sweep. A task owns the whole
+requested token list, so an initial failure fails that group before smaller
+points run. Rows already measured before a later failure retain their original
+keys and values; historical measurements remain unchanged.
