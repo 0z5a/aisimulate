@@ -142,6 +142,9 @@ the token counts, batch/sequence sweeps, parallelism sizes, routing
 distributions, and generator constraints. Model YAML stores model dimensions;
 base op YAML stores the reusable sweep policy.
 
+See [Agentic workload coverage](agentic_coverage.md) for workload-derived
+budgets, their equations, and the remaining native qualification requirements.
+
 MoE quantization is resolved before a case is queued. Base `quantization_modes`
 may declare `min_sm` (axis-level hardware floor), runtime features, an
 `allowed_model_paths` allowlist, and optional `module_config`. A model row
