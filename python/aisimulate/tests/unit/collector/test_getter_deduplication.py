@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
 from collector.case_generator import MoeCommonTestCase
 
 pytestmark = pytest.mark.unit
@@ -408,7 +409,7 @@ def test_vllm_sm90_repository_moe_getter_excludes_unconsumable_dsv4_cases(monkey
     # +33 GLM-5.3-Flash fp8_block cases (288 experts/top-8/4096/2048, TP 1-32
     # or EP 2-256; its nvfp4 row needs SM100 and is absent here).
     assert len(cases) == 2223
-    assert sum(len(case[1]) for case in cases) == 60021
+    assert sum(len(case[1]) for case in cases) == 64467  # 29 token anchors per existing invocation.
     # MiniMax-M3's declared MoE geometry must be present as its own rows —
     # a generator defect could drop it while unrelated cases preserve the
     # aggregate counts above. (case[:8] = moe_type, num_tokens, hidden,
@@ -480,7 +481,7 @@ def test_vllm_nemotron_uses_latent_moe_width(monkeypatch, model_path, moe_type, 
     cases = module.get_moe_test_cases()
 
     assert len(cases) == 42
-    assert sum(len(case[1]) for case in cases) == 1134
+    assert sum(len(case[1]) for case in cases) == 1218
     assert {case[0] for case in cases} == {moe_type}
     assert {case[2] for case in cases} == {expected_hidden_size}
 

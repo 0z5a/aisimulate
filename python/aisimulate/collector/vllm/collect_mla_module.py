@@ -861,9 +861,11 @@ def _create_attention_module(
         num_gpu_blocks=num_kv_cache_blocks,
         max_num_seqs=max_batch_size,
         # The serving scheduler budgets NEW tokens, excluding computed prefix
-        # tokens (v1/core/sched/scheduler.py:472-480 @v0.25.1). DeepseekV2Model
-        # sizes its indexer output as [max_num_batched_tokens, index_topk]
-        # (model_executor/models/deepseek_v2.py:1355-1361 @v0.25.1). Keep the
+        # tokens. At v0.30.0 (ced6857a), DeepseekV2Model sizes its indexer
+        # output as [max_num_batched_tokens, index_topk] (deepseek_v2.py:
+        # 1437-1444), and FlashMLA sparse uses the same token capacity for
+        # q_concat_buffer (flashmla_sparse.py:699-707,742-755). The expanded
+        # 32768-token DSA grid fits these native construction bounds. Keep the
         # existing sweep floor, but do not allocate one output row per cached
         # token. max_model_len and KV capacity still include the entire prefix.
         max_num_batched_tokens=max(max_batch_size * max_query_len, 131072) if is_context else max_batch_size,

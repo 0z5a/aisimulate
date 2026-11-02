@@ -124,7 +124,7 @@ def standalone_mla_footprint_bytes(case, *, backend: str, projected: bool = True
     before returning cases. TRT-LLM builds full-head context K/V; SGLang uses
     one latent head and either 128 projected or 512 latent query dimensions.
     """
-    sequence, batch, _, dtype, heads, _, tp, page, _, _, is_context = case
+    sequence, batch, query_width, dtype, heads, _, tp, page, _, _, is_context = case
     heads //= tp
     elem = 1 if "fp8" in str(dtype).lower() or "float8" in str(dtype).lower() else 2
     total_length = sequence + (0 if is_context else 1)
@@ -132,6 +132,11 @@ def standalone_mla_footprint_bytes(case, *, backend: str, projected: bool = True
     memory = cache_tokens * 576 * elem
     query_tokens = batch * (sequence if is_context else 1)
     if backend == "trtllm":
+        # rc29 c76f4a856 attention/backends/interface.py:783,823-836 creates
+        # duplicate FP32 cos/sin plus dim/2 inverse frequencies. Match the
+        # synthetic Scenario/cache-manager capacity in collect_mla.run_mla.
+        rope_positions = max(163840, sequence + (1 if is_context else 2) * query_width)
+        memory += (rope_positions * 64 * 2 + 64 // 2) * 4
         # Context: compressed KV, RoPE, projected Q, packed KV, concatenated K,
         # latent-cache concatenation and output; all activations stay BF16.
         entry = 2 * 576 + heads * (192 + 256 + 192 + 128) if is_context else 2 * 576 + heads * (576 + 64 + 512)

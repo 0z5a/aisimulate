@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from collector.attention_memory import filter_attention_cases
 from collector.case_generator import (
     get_attention_context_shape_sweeps,
@@ -917,9 +918,9 @@ def test_default_vllm_context_grid_covers_published_qwen_prefills(monkeypatch, m
         40960,
     ]
     assert set(itertools.product([1, 2, 4, 8, 16], published_lengths)) <= qwen_pairs
-    # The larger budget also admits this existing anchor; it remains unmeasured.
-    assert (1, 262144) in qwen_pairs
-    assert (4, 262144) not in qwen_pairs
+    # The shared 1M aggregate budget admits B4 at the existing 256K anchor.
+    assert {(1, 262144), (4, 262144)} <= qwen_pairs
+    assert (8, 262144) not in qwen_pairs
 
 
 def test_gemm_common_cases_expand_from_base_op_yaml_shape_specs():
@@ -1384,7 +1385,7 @@ def test_mla_module_metadata_and_micro_sweeps_are_yaml_backed():
     vllm_specs = get_mla_module_model_specs(backend="vllm")
 
     assert sweep.batch_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-    assert sweep.sequence_lengths[-2:] == [8192, 16384]
+    assert sweep.sequence_lengths[-2:] == [16384, 32768]
     assert sweep.inner_sweep_head_counts == [128, 64, 32, 16, 8]
     assert sweep.top_level_head_counts == [128, 64, 32, 16, 8]
     assert sweep.module_precision_combos == [("bfloat16", "bfloat16", "bfloat16")]
@@ -1427,7 +1428,7 @@ def test_mla_module_metadata_and_micro_sweeps_are_yaml_backed():
         ("bfloat16", "fp8", "nvfp4"),
         ("fp8", "fp8", "nvfp4"),
     ]
-    assert get_mla_module_sweep_spec("sglang").context_sequence_lengths[-2:] == [8192, 16384]
+    assert get_mla_module_sweep_spec("sglang").context_sequence_lengths[-2:] == [16384, 32768]
 
     vllm_sweep = get_mla_module_sweep_spec("vllm")
     assert vllm_sweep.context_sequence_lengths[-1] == 32768

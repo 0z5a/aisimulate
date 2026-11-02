@@ -2,7 +2,7 @@
 
 This document defines collector coverage targets for agentic replay, the workload evidence behind them, and the checks required before collected data can be trusted. Shared ranges belong in [base operation cases](base_ops/); correlated model geometry belongs in [model cases](models/). Coverage is enabled by default, without an agentic toggle.
 
-**Status:** the budgets below are coverage targets, not a statement that all targets are implemented or GPU-qualified. Implementation facts were checked at AISim commit [`36a69a683c60081e61d6379f868b1c7257e1a41e`](https://github.com/ai-dynamo/aisimulate/commit/36a69a683c60081e61d6379f868b1c7257e1a41e). The workload snapshot is **2 November 2026**. Update the target, implementation status, and qualification together when the source or workload changes.
+**Status:** implemented defaults and remaining targets are distinguished below. Implementation does not establish GPU feasibility, timing accuracy, or complete replay support. The workload snapshot is **2 November 2026**. Update the budget, implementation status, and qualification together when the source or workload changes.
 
 The workload analysis covers **808 active NVIDIA configurations**, with AMD excluded. The source review covers **78 CUDA collector registry routes**, grouped into **36 operation families**. Public request records establish history demand and configuration envelopes; they do not expose every executed per-rank GPU forward. A missing exact anchor is not automatically a functional replay failure: interpolation, extrapolation, and declared fallback paths are separate contracts.
 
@@ -10,24 +10,23 @@ Token shorthand uses binary multiples: **1K = 1,024 tokens; 1M = 1,048,576 token
 
 ## Coverage targets
 
-“Target” identifies a concrete missing range or collector inconsistency. “Conditional target” requires the named model, serving recipe, or native path. “Retain” means no broader range is established by the available evidence. None of these labels means that every declared shape has passed GPU qualification.
+“Implemented” identifies enabled collector defaults. “Conditional target” identifies follow-up work requiring the named model, serving recipe, or native path. “Retain” means no broader range is established by the available evidence. None of these labels means that every declared shape has passed GPU qualification.
 
 | Operation / setting | Budget | Status and rationale |
 |---|---|---|
-| Shared dense MHA/GQA context | Include **65,536 and 131,072** full-history anchors for vLLM, SGLang, and TRT-LLM; preserve existing anchors | **Target.** The declared list jumps from 40,960 to 262,144. Supported Qwen3.5 layers query full history even for small new chunks. These B1 anchors fit the existing 655,360 aggregate cap. |
-| Ordinary fused MoE | Token anchors through **32,768 and 65,536**; optional 24,576 and 49,152 | **Target.** The declared ceiling is 16,384. Local work can reach 32K; generic MoE can gather 16K local tokens across attention DP 4 into a 64K table query. These are configuration envelopes, not observed filled forwards. Preserve backend-specific token keys and TP/EP geometry. |
-| SGLang MSA context | Per-request new-query anchor **32,768**; retain **131,072** aggregate new-token budget | **Target.** MiniMax settings permit a 32K local chunk, while the declared query axis ends at 16K. Match the native chunk setting and admit query/history/batch jointly. |
-| Standalone TRT-LLM MLA | Full history through the intended model's supported limit, up to **1,048,576** | **Target requiring a runtime fix.** YAML declares 1M, but the fixed Scenario/RoPE limit is 163,840. Align runtime capacity and qualify actual geometry; YAML alone cannot resolve the mismatch. |
-| Ordinary TRT-LLM MoE completeness | Every requested shape must produce a measurement or a classified failure | **Target requiring a collector fix.** A failed largest-token dry run can currently select a smaller count and silently omit larger declared rows. A larger list cannot establish coverage while execution shrinks it. |
-| KDA verification | Query widths **{2,3,4,5,6,8}** tokens/request; preserve verifier batch/state geometry | **Target.** The declared widths are {2,4,8}. Active vLLM Kimi settings require exact width anchors 3,5,6. SGLang's checked DSpark draft-token knob already represents width; do not add one twice. |
-| NCCL all-gather / reduce-scatter | Benchmark payloads through **1 GiB** for the GLM non-DeepEP gather path | **Target.** Local 16K × DP 4 × hidden 6,144 × BF16 2 bytes produces a 768 MiB gathered-buffer key, above the declared 512 MiB ceiling. Match collective, dtype, and topology. |
+| Shared dense MHA/GQA context | **65,536, 131,072, 524,288 and 1,048,576** full-history anchors; **B × S ≤ 1,048,576** on vLLM, SGLang and TRT-LLM | **Implemented.** Preserve old anchors, geometry, precision and independent index/memory guards. The 64K/128K intervals serve supported Qwen3.5; the shared 1M tail is policy for eligible geometries, not evidence that every active model uses dense attention. |
+| Ordinary fused MoE | Token anchors through **32,768 and 65,536** | **Implemented.** Local work can reach 32K; generic MoE can gather 16K local tokens across attention DP 4 into a 64K table query. These are configuration envelopes, not observed filled forwards. Preserve backend-specific token keys and TP/EP geometry. |
+| SGLang MSA context | Per-request new-query anchor **32,768**; retain **131,072** aggregate new-token budget | **Implemented.** MiniMax settings permit a 32K local chunk. Native chunk capacity follows the planned query batch; query/history/batch and model limits remain joint constraints. |
+| Standalone TRT-LLM MLA | Synthetic full history through **1,048,576**; retain native head/precision restrictions | **Implemented.** Size Scenario/RoPE capacity for the native cache manager instead of rejecting lengths above 163,840. Preserve YaRN factor 40 and original-position 4,096; charge the duplicate FP32 RoPE allocation to memory admission. This does not change any checkpoint's positional definition. |
+| Ordinary TRT-LLM MoE completeness | Every requested shape must produce a measurement or a classified failure | **Implemented.** Dry-run the actual largest requested count; propagate tuning and execution failures. The existing task groups a whole token sweep, so a failure in its initial dry run fails that group before smaller counts run. No task/schema change is introduced. |
+| KDA verification | Query widths **{2,3,4,5,6,8}** tokens/request; preserve verifier batch/state geometry | **Implemented.** Active vLLM Kimi settings require exact width anchors 3,5,6. SGLang's checked DSpark draft-token knob already represents width; do not add one twice. |
+| NCCL all-gather / reduce-scatter | Default benchmark payloads through **1 GiB** | **Implemented.** Local 16K × DP 4 × hidden 6,144 × BF16 2 bytes produces a 768 MiB gathered-buffer key. The shared NCCL sweep also extends all-reduce/all-to-all; dtype and topology remain separate axes. |
 | Ordinary MoE above 64K | **131,072** global token anchor for qualified MiniMax recipes | **Conditional target.** A vLLM decode configuration permits 8,192 local scheduled tokens × DP 16. Native AgRs is logged, but executed batch/verifier tuples and the final selected compute table still need verification. |
 | NCCL large DP groups | Payloads through **2 GiB**, including a **16-rank** topology | **Conditional target.** The same MiniMax allowance gives 1.5 GiB gathered BF16 activations. More bytes on an eight-GPU table do not establish 16-rank coverage. |
-| Shared dense context tail | Full-history anchors **524,288 and 1,048,576**; aggregate **B × S ≤ 1,048,576**; optional 786,432 anchor | **Conditional coverage policy.** This provides a shared tail for eligible geometries, not a demonstrated requirement for every active model. Qwen3.5 stops at 256K; GLM/MSA/DSV4.1 use separate sparse paths. Kimi's native MLA path is preferred; its declared dense fallback geometries still fail the index guard at 1M. |
-| SGLang MLA/DSA/MSA generation history | Add applicable **786,432, 917,504**, and legal near-1M past-history anchors within existing aggregate budgets | **Conditional target.** GLM/MSA request histories exceed the primary 720,896 axis. Extra B1 model-boundary points do not establish multi-batch coverage. MLA applicability depends on the routed model; active Kimi configurations use vLLM. |
-| vLLM DSA context | **B × q ≤ 32,768** when the serving recipe permits it; preserve the separate full-history bound | **Conditional target.** The query list reaches 32K, but the declared 16K new-token cap removes those points. No active vLLM GLM 32K forward was established. |
-| SGLang DSA / GLM sparse queries | Query anchor **32,768** for a matching native recipe; retain **131,072** aggregate new-token cap unless demand exceeds it | **Conditional target.** Check DSA runtime filters independently of MiniMax MSA. Sharing collector code does not establish the same requirement for every model. |
-| WideEP expert compute | Applicable local prefill axis through **32,768**, or TRT global-token axis through **65,536** | **Conditional target.** Convert the workload to the actual table key. An ordinary MoE global 64K query is not 64K on each EP rank. Routing, occupancy, receive capacity, and topology remain independent. |
+| SGLang MLA/DSA/MSA generation history | Add **786,432, 917,504 and 1,048,575** past-history anchors within existing aggregate budgets | **Implemented.** GLM/MSA histories exceed 720,896. Model positional limits still apply, and a legal boundary depends on native verifier width. MLA applicability depends on the routed model; active Kimi configurations use vLLM. |
+| vLLM DSA context | **B × q ≤ 32,768**; retain separate 1M aggregate full-history bound | **Implemented for native-capable recipes.** The query list already reached 32K; the old 16K aggregate cap removed these points. This does not establish an observed active GLM 32K forward. |
+| SGLang DSA / GLM sparse queries | Query anchor **32,768**; retain **131,072** aggregate new-token cap | **Implemented for matching native capacity.** Size the default prefill harness from planned queries; preserve explicit overrides and independent model/index/pool limits. Runtime violations fail visibly. |
+| WideEP expert compute | TRT global-token axis through **65,536**; local-axis expansion remains conditional | **Inherited on TRT** from the shared MoE token list; its existing global-key mapping is unchanged. vLLM/SGLang WideEP use separate grids. A global 64K query is not 64K on each EP rank; routing, receive capacity, and topology still require qualification. |
 | DSV4.1 module manifests | Legal joint cases through **1M total history** and **32K new query**, with exact stage identities | **Conditional target.** Request history reaches 992,350, while the default manifest is B ∈ {1,2}, q ≤ 1,024, prefix ≤ 1,024 and the route is unverified. Speculation/DP/CP restrictions require separate work. |
 | Dense / MLA / DSA / MSA decode aggregates | Retain family-specific budgets until a **correlated per-rank tuple census** establishes a replacement | **Retain.** Client concurrency and global interval overlap are not native GPU batches. Static verifier expansion is not physical KV replication. |
 | GEMM, scale operations, recurrent context, MLA BMM, mHC, encoder, and most A2A paths | Retain the operation-specific ranges listed below | **Retain.** These use new-token, batch, geometry, or message axes. Long retained history alone does not increase them. |
@@ -112,7 +111,7 @@ The [dense consumer](../../../../crates/core/src/perfmodel/operators/attention.r
 
 For example, `p = 32,768` cached tokens and `q = 128` new tokens require the `S = 32,896` lookup; per-request GEMM/recurrent work still uses only 128 new tokens. Small new queries therefore still need long-history anchors.
 
-The declared budget `655,360 = 16 × 40,960` represents **16 synthetic lanes × 40,960 history tokens/lane**; it is not an all-workload percentile. The proposed `1,048,576 = 1 × 1,048,576` is **one request × the 1M history anchor**. It is the minimum aggregate cap admitting that B1 point, not proof of adequate multi-request coverage.
+The previous budget `655,360 = 16 × 40,960` represents **16 synthetic lanes × 40,960 history tokens/lane**; it is not an all-workload percentile. The enabled budget `1,048,576 = 1 × 1,048,576` is **one request × the 1M history anchor**. It is the minimum aggregate cap admitting that B1 point, not proof of adequate multi-request coverage.
 
 | Full history S | Maximum B from a 1,048,576 token-position cap |
 |---:|---:|
@@ -212,9 +211,9 @@ For the verified vLLM Kimi path:
 
 `V = N_spec + 1`.
 
-`N_spec` is configured speculative tokens; **1** is the base target token. The pinned [native vLLM KDA metadata](https://github.com/vllm-project/vllm/blob/e4a5b5537344b103ed10de7764378ef09604ef3d/vllm/models/kimi_k3/nvidia/kda_metadata.py#L352) passes `spec_query_len = 1 + num_speculative_tokens`. Settings `{2,3,4,5,7}` yield widths `{3,4,5,6,8}`. The [declared collector widths](base_ops/kda.yaml) `{2,4,8}` lack **3,5,6**. They are target query widths, not accepted-token counts.
+`N_spec` is configured speculative tokens; **1** is the base target token. The pinned [native vLLM KDA metadata](https://github.com/vllm-project/vllm/blob/e4a5b5537344b103ed10de7764378ef09604ef3d/vllm/models/kimi_k3/nvidia/kda_metadata.py#L352) passes `spec_query_len = 1 + num_speculative_tokens`. Settings `{2,3,4,5,7}` yield widths `{3,4,5,6,8}`. The [collector widths](base_ops/kda.yaml) now include `{2,3,4,5,6,8}`, adding **3,5,6** to the previous grid. They are target query widths, not accepted-token counts.
 
-Explicit width settings were available for 62/82 Kimi points; 50/62 require missing exact widths 3/5/6. The other 20 have insufficient evidence, not proven disabled speculation. In the checked SGLang DSpark path, [`speculative_num_draft_tokens` already represents V](https://github.com/sgl-project/sglang/blob/e00930c5489053f26d86b179cee0d087f846acbb/python/sglang/srt/speculative/dspark_components/dspark_config.py#L51). Preserve verifier batch, adaptive/ragged execution, state layout, and native kernel identity separately from width coverage. The [KDA consumer](../../../../crates/core/src/perfmodel/operators/mamba.rs) recovers request batch and queries `(B_d,V)`.
+Explicit width settings were available for 62/82 Kimi points; 50/62 require the newly added exact widths 3/5/6. The other 20 have insufficient evidence, not proven disabled speculation. In the checked SGLang DSpark path, [`speculative_num_draft_tokens` already represents V](https://github.com/sgl-project/sglang/blob/e00930c5489053f26d86b179cee0d087f846acbb/python/sglang/srt/speculative/dspark_components/dspark_config.py#L51). Preserve verifier batch, adaptive/ragged execution, state layout, and native kernel identity separately from width coverage. The [KDA consumer](../../../../crates/core/src/perfmodel/operators/mamba.rs) recovers request batch and queries `(B_d,V)`.
 
 ### Communication bytes and topology
 
@@ -264,7 +263,7 @@ A small GPU's failure must not remove feasible large-GPU shapes globally. As an 
 
 Keep these constraints independent:
 
-- [TRT standalone MLA](../trtllm/collect_mla.py): fixed 163,840 Scenario/RoPE limit and decode-head restrictions.
+- [TRT standalone MLA](../trtllm/collect_mla.py): synthetic Scenario/RoPE capacity follows the cache-manager allocation; native decode-head/precision restrictions remain. Checkpoint limits apply independently to model-module collectors.
 - [SGLang DSA](../sglang/collect_mla_module.py): context-only indexer aggregate-KV cap `2^25 = 33,554,432`, plus actual chunk/pool capacity. The context cap is not a decode filter and does not reject the 52 × 720,896 generation point.
 - [vLLM DSA](../vllm/collect_mla_module.py): separate `B × (p + q) ≤ 1,048,576` full-history filter.
 - [GDN/KDA](base_ops/gdn.yaml): convolution indexing and CUDA grid limits, independent of history coverage.
@@ -279,40 +278,40 @@ This table is the complete 36-family disposition. “Retain” is not proof that
 
 | Family | Budget | Status / qualification |
 |---|---|---|
-| Dense context | 64K/128K anchors; conditional 512K/1M anchors and 1M aggregate cap | Target; [shared defaults](base_ops/attention_context.yaml), index/native constraints above |
+| Dense context | 64K/128K/512K/1M anchors and 1M aggregate cap | Implemented; [shared defaults](base_ops/attention_context.yaml), index/native constraints above |
 | Dense generation | 16,777,216 aggregate total-token positions | Retain pending rank tuples; preserve feasible low-batch 1M anchors; [defaults](base_ops/attention_generation.yaml) |
 | Encoder attention | Sequence 65,536; aggregate 131,072 | Retain; decoder history does not establish encoder demand; [defaults](base_ops/attention_encoder.yaml) |
-| Standalone MLA context | 1M full-history aggregate | Declared; resolve TRT 163,840 runtime mismatch; [defaults](base_ops/mla.yaml) |
-| Standalone MLA generation | 16M aggregate total-token positions | Retain pending tuples; same TRT runtime mismatch |
+| Standalone MLA context | 1M full-history aggregate | Implemented; synthetic TRT capacity follows its cache manager; [defaults](base_ops/mla.yaml) |
+| Standalone MLA generation | 16M aggregate total-token positions | Retain pending tuples; synthetic TRT capacity now matches its cache manager |
 | Generic MLA context | 1M full-history list and aggregate budget | Declares B1 tail; verify actual route, geometry, and execution; [defaults](base_ops/mla_module.yaml) |
-| Generic MLA generation | vLLM/TRT 33,554,432; SG 37,486,592 aggregate past-token positions | Retain caps; conditional SG long-history axis expansion |
-| vLLM DSA context | Conditional 32K new-token aggregate; separate 1M aggregate full history | Target requires matching local chunk and native indexer support |
-| SGLang DSA context | Conditional q = 32K; aggregate 131,072 | Match native chunk; preserve independent model/index/pool bounds |
+| Generic MLA generation | vLLM/TRT 33,554,432; SG 37,486,592 aggregate past-token positions | Retain caps; SG history axis now reaches 1,048,575 |
+| vLLM DSA context | 32K new-token aggregate; separate 1M aggregate full history | Implemented; requires matching local chunk and native indexer support |
+| SGLang DSA context | q = 32K; aggregate 131,072 | Match native chunk; preserve independent model/index/pool bounds |
 | TRT DSA context | q = 32K; aggregate 131,072 | Retain; qualify long-prefix logits/workspace |
 | DSA generation | Generic MLA backend budgets above | Retain pending tuples; distinguish full-index and reused-index rows |
-| MSA context | q = 32K; aggregate 131,072 | Add missing SG q anchor; vLLM/TRT declare it. TRT Triton-reference aggregate 32K is a separate limit |
+| MSA context | q = 32K; aggregate 131,072 | All three frameworks declare it. TRT Triton-reference aggregate 32K is a separate limit |
 | MSA generation | 33,554,432 aggregate past-token positions | Retain; SG uses this cap rather than 37,486,592 |
 | DSV4 module | vLLM/TRT default history 64K; SG model grid through 1M | Retain; no active V4-Pro basis for expansion; [defaults](base_ops/dsv4_attention.yaml) are separate from V4.1 |
 | DSV4 sparse kernels | vLLM new-token budget 8K; SG runtime-derived chunk; aggregate full history 1M | Retain distinct paths; [model grid](models/DeepseekV4ForCausalLM_cases.yaml) does not alone set registered SG sparse shapes |
 | DSV4 calibration | Owning module-derived q/p/B axes | No independent history budget; [calibration](../sglang/deepseekv4_sparse_modules.py) measures variant-qualified top-k distributions |
 | DSV4.1 module | Conditional legal 1M history / 32K new-query manifests | Target after feature/backend eligibility; [default manifest](base_ops/dsv41_module.yaml) is short and unverified |
 | GLM5.3-Flash attention | Regular 128K history; long class up to 1M at B1; 8K new-token budget | Retain; no active points justify expansion; [contract](base_ops/glm53flash_attention.yaml) |
-| GLM5 sparse kernels | Exact DSA q/p/B axes and indexer identity | Conditional DSA expansion; 8,000,000 scoring elements trigger chunking, not a coverage ceiling; [implementation](../sglang/glm5_dsa_sparse_modules.py) |
+| GLM5 sparse kernels | Exact DSA q/p/B axes and indexer identity | DSA query expansion implemented; 8,000,000 scoring elements trigger chunking, not a coverage ceiling; [implementation](../sglang/glm5_dsa_sparse_modules.py) |
 | GEMM | 32,768 token rows | Retain unless actual mapped M exceeds it; verify N/K and precision; [defaults](base_ops/gemm.yaml) |
 | Compute-scale / scale-matrix | 32,768 rows | Retain local M mapping; no automatic MoE DP expansion; [defaults](base_ops/compute_scale.yaml) |
 | MLA BMM pre | Effective batch through 8,192 | Retain; consumer receives batch, not prefill-token total; [defaults](base_ops/mla_bmm_gen_pre.yaml) |
 | MLA BMM post | Effective batch through 20,480 | Retain for the same reason; [defaults](base_ops/mla_bmm_gen_post.yaml) |
 | mHC | New-token rows through 524,288 | Retain; operator variant/geometry remain separate; [defaults](base_ops/mhc.yaml) |
 | GDN | Context q = 32K, B = 64; decode B = 1,024 | Retain pending actual request batches; no historical-token scan; [defaults](base_ops/gdn.yaml) |
-| KDA | Same context/decode range; verify widths {2,3,4,5,6,8}, B ≤ 256 | Width expansion target; preserve state/geometry; [defaults](base_ops/kda.yaml) |
+| KDA | Same context/decode range; verify widths {2,3,4,5,6,8}, B ≤ 256 | Width expansion implemented; preserve state/geometry; [defaults](base_ops/kda.yaml) |
 | Mamba2 | Context q = 32K, B = 64; decode B = 1,024 | Retain; no active-family basis for expansion; [defaults](base_ops/mamba2.yaml) |
-| Ordinary MoE | 32K/64K rows; conditional 128K | Target with exact consumer key; fix TRT silent omissions; [defaults](base_ops/moe.yaml) |
-| WideEP expert compute | Conditional local 32K or TRT global 64K | Preserve backend key mapping; SG local decode remains 128 until justified; [collectors](../wideep/) |
+| Ordinary MoE | 32K/64K rows; conditional 128K | 32K/64K implemented; TRT no longer silently shrinks; [defaults](base_ops/moe.yaml) |
+| WideEP expert compute | TRT global 64K inherited; local 32K conditional | Preserve backend key mapping; SG local decode remains 128 until justified; [collectors](../wideep/) |
 | Shared MoE A2A | HT 65,536 and LL 256 per-rank tokens | Retain; topology/geometry/receive buffers may limit execution first; [defaults](base_ops/moe_a2a.yaml) |
 | Legacy SGLang DeepEP LL | Per-rank tokens through 1,024 | Retain; dynamically sized dispatch capacity and correct consumer-table identity; [collector](../wideep/sglang/collect_deepep_ll.py) |
 | Legacy SGLang DeepEP normal | Per-rank tokens through 131,072 | Retain; its 1,024 correctness-check threshold does not cap performance collection; [collector](../wideep/sglang/collect_deepep_normal.py) |
 | DSV4 MegaMoE | Local prefill 32K, decode 512 | Retain; no generic MoE DP multiplier; [collector](../sglang/collect_dsv4_megamoe.py) |
-| NCCL | 1 GiB; conditional 2 GiB and 16-rank topology | Target for the named gathered envelopes; [collector](../network/collect_nccl.py) |
+| NCCL | 1 GiB; conditional 2 GiB and 16-rank topology | 1 GiB default implemented; [collector](../network/collect_nccl.py) |
 | Custom all-reduce | 536,870,912 elements, or 1 GiB at 2 bytes/element | Retain; units differ from NCCL CLI bytes; [collector](../network/collect_all_reduce.py) |
 | TRT fixed-geometry all-to-all | 65,536 tokens at hidden width 7,168 / 256 experts / top-k 8 | Retain range; use model-correlated collection for other geometry; [collector](../network/slurm/collect_trtllm_alltoall.py) |
 
@@ -328,15 +327,29 @@ Estimate incremental collection time as:
 - All time terms are seconds. `ΔT_setup_groups` charges additional worker/model-group initialization once per group, not once per inner shape.
 - Deduplicate shared physical geometry and include old anchors made eligible by a larger budget. For example, B4 at the existing 262,144 anchor contributes cost even though the anchor itself is unchanged.
 
-A structural census using the [existing getter test harness](../../tests/unit/collector/test_dense_attention_agentic.py) and the checked source revision produced the following result for a shared 1M cap plus 64K/128K/512K/1M anchors:
+A structural census using the [existing getter test harness](../../tests/unit/collector/test_dense_attention_agentic.py) comparing the previous defaults with the enabled defaults produced the following result for a shared 1M cap plus 64K/128K/512K/1M anchors:
 
-| Backend | Existing cases | Target cases | Additional cases | Optional 786,432 adds |
+| Backend | Previous cases | Enabled cases | Additional cases | Optional 786,432 adds |
 |---|---:|---:|---:|---:|
 | vLLM | 71,858 | 80,270 | 8,412 | 414 |
 | SGLang | 83,178 | 92,469 | 9,291 | 465 |
 | TRT-LLM | 104,166 | 115,821 | 11,655 | 570 |
 
-That is **29,358 additional cases before actual-device filtering**, plus 1,449 for the optional anchor. Reproduce the structural method by copying resolved context sweeps in memory, adding the named anchors, setting both aggregate caps to 1,048,576, and calling each getter body through the harness. Use its explicit SM103/backend/page mocks; retain original geometry/precision. Compare original and target case sets. CPU-only, 80 GiB, and 267.689 GiB estimate profiles, with and without the optional anchor, retained all old cases across 18 profiles. These are mock-based structural/memory estimates, not live native dispatch, GPU feasibility, or measured runtime.
+That is **29,358 additional cases before actual-device filtering**, plus 1,449 for the optional anchor. Reproduce the structural method by calling each actual getter body through the harness with the previous and enabled resolved context sweeps. Use its explicit SM103/backend/page mocks; retain original geometry/precision. Compare original and target case sets. CPU-only, 80 GiB, and 267.689 GiB estimate profiles, with and without the optional anchor, retained all old cases across 18 profiles. These are mock-based structural/memory estimates, not live native dispatch, GPU feasibility, or measured runtime. With the enabled defaults, added cases after estimated memory admission are **8,366 / 8,830 / 10,700** at 80 GiB and **8,412 / 9,291 / 11,637** at 267.689 GiB, ordered vLLM/SGLang/TRT-LLM. All old cases survive in each profile.
+
+Relative to baseline `e6b1fe2`, the combined dense context/decode expansion adds **47,630 vLLM / 48,076 SGLang / 58,119 TRT-LLM** cases before device admission. At an **assumed** five steady-state seconds per added case, this is **66.15 / 66.77 / 80.72 GPU-hours**. Five seconds is an illustrative scenario, not a measured forecast or upper bound; module, MoE, recurrent and network work, queue time and cold setup are excluded. The new 29,358-case context increment alone contributes **40.78 GPU-hours** under that assumption.
+
+The ordinary-MoE actual-getter census on mocked SM103 expands inner token cells while leaving setup-group counts unchanged:
+
+| Backend | Groups | Previous cells | Enabled cells | Additional cells |
+|---|---:|---:|---:|---:|
+| vLLM | 3,135 | 84,645 | 90,915 | 6,270 |
+| SGLang | 7,503 | 202,581 | 217,587 | 15,006 |
+| TRT-LLM | 11,385 | 307,395 | 330,165 | 22,770 |
+
+Each group changes from 27 to 29 token anchors: **7.41% more cells**, but the sum of token counts is **2.70×** the old sum. That ratio is a linear-work proxy, not elapsed runtime; routing, native chunking, autotuning and failures matter. Kimi KDA verification changes from **108 to 216 cells per backend**, with the 12 geometry/precision groups unchanged; all-phase KDA cells change from 600 to 708. The NCCL range adds one size per collective/dtype/topology combination: the local 4-collective × 2-dtype × 3-topology driver adds **24 measurements**, with native warmup/startup charged for each. None of these counts establishes GPU feasibility.
+
+Earlier measured campaigns provide limited context: 95 Qwen B300/vLLM prefill rows took **52.751 seconds** collector time (18 added anchors were not timed separately); 500 GLM B300/SGLang rows took **1.213 GPU-hours**, with about **30.1 minutes per group** attributed to its 96 added shapes, mostly history seeding. This is within-run attribution, not a controlled before/after comparison. These older campaigns do not qualify the newly enabled sizes.
 
 For otherwise identical B1 full-prefill cases, increasing S from 262,144 to 1,048,576 changes ideal attention-pair work by:
 

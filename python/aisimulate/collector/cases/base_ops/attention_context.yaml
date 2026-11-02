@@ -44,7 +44,11 @@ all_frameworks_op_cases:
       - 24576
       - 32768
       - 40960
+      - 65536
+      - 131072
       - 262144
+      - 524288
+      - 1048576
       query_head_counts:
       - 1
       - 2
@@ -67,8 +71,8 @@ all_frameworks_op_cases:
       head_dims:
       - 128
       - 256
-      max_tokens_self_attention: 655360
-      max_tokens_grouped_query_attention: 655360
+      max_tokens_self_attention: 1048576
+      max_tokens_grouped_query_attention: 1048576
       max_batch_size_self_attention: 128
       max_kv_elements: 2147483647
       precision_cases:

@@ -72,22 +72,30 @@ Disabling graph padding requires explicit bucket membership. This follows the
 `mla_module.yaml` declares a shared dense-MLA context sequence axis
 (`mla_context_sequence_lengths`) and token budget (`context.mla_max_tokens`).
 They declare full-history queries through 1,048,576 tokens on vLLM, SGLang
-and TRT-LLM; native model and backend limits still apply. Sparse modules retain their existing new-token/chunk axes; their
-cached histories use the prefix and decode axes instead. TRT-LLM DSA and
+and TRT-LLM; native model and backend limits still apply. Sparse DSA/MSA
+modules include 32K new-query anchors; their cached histories use the prefix
+and decode axes instead. TRT-LLM DSA and
 TRT-LLM/vLLM MSA now include 4K through 1M prefix anchors, and their decode
-axes reach 1,048,575 cached tokens. SGLang's existing DSA/MSA history coverage
-and measured GLM decode execution path remain unchanged.
+axes reach 1,048,575 cached tokens. SGLang's shared generation history axis
+now adds 786,432, 917,504 and 1,048,575; the existing GLM decode execution
+path and previously measured rows remain unchanged.
 
 For an exact dense-MLA context manifest, SGLang sizes its native prefill chunk
 capacity from the largest planned query-token batch. This permits full-history
 module forwards beyond the default serving chunk; an explicit chunk override
-still takes precedence. DSA keeps its existing chunked-prefill configuration.
+still takes precedence. DSA context also sizes its default chunk from the
+planned query batch and uses an explicit 0.90 static-memory fraction, avoiding
+the native serving heuristic that would reserve 192 GiB for a 131K chunk.
+The requested pool and per-point capacity validation remain independent;
+generation keeps its native default configuration. Chunk/pool violations
+raise visible failures rather than dropping planned context points.
 Memory planning resolves the same bundled or local model config as execution.
 
 The standalone MLA adapters share the expanded `mla.yaml` grid. SGLang's
-mock runner now advertises the actual case length. TRT-LLM's standalone
-harness still uses its fixed DeepSeek Scenario RoPE capacity (163,840); larger
-queued shapes raise a classified native-limit error. Full TRT-LLM modules use
+mock runner advertises the actual case length. TRT-LLM's synthetic standalone
+harness sizes Scenario/RoPE capacity to the cache manager while preserving
+YaRN factor 40 and original-position 4,096. Its memory estimate includes the
+native duplicate FP32 RoPE table; head/precision restrictions remain. Full TRT-LLM modules use
 the real model's positional limit, size token/sequence capacities for each
 case, and evict the old cached layer when those capacities change. Expanding
 a sweep never extends a checkpoint's RoPE model definition.
@@ -106,7 +114,8 @@ collection-cost estimates must count those cells as well as new lengths.
 ## Long-history decode defaults
 
 The shared MLA/DSA grid preserves existing batches and lengths, adds batch
-`52` and past-KV lengths `262144, 393216, 524288, 655360, 720896`, and raises
+`52` and past-KV lengths `262144, 393216, 524288, 655360, 720896, 786432,
+917504, 1048575`, and retains
 the aggregate token budget to `37486592` (`52 * 720896`). MSA shares those
 SGLang history axes but keeps its `33554432` budget. These defaults apply to
 all declared models and precisions. Model-context violations remain visible

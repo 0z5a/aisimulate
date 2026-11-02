@@ -16,3 +16,12 @@ The standalone scripts keep their staging output names (`nccl_perf.txt`,
 `trtllm_alltoall_perf.txt`). Collector finalization converts accepted output
 to parquet under
 `src/aisimulate_core/systems/data/<system>/comm/<backend>/<version>/`.
+
+NCCL sweeps include payloads from 512 bytes through 1 GiB by default, using
+`--range 512,1073741825,2` (exclusive upper endpoint). This brackets the
+768 MiB gathered activation envelope described in
+[agentic workload coverage](../cases/agentic_coverage.md). The CLI range is
+bytes; persisted `message_size` is elements after dtype conversion. For
+all-gather and reduce-scatter, compare the gathered buffer size rather than
+one rank's contribution. The local driver retains its 2/4/8-GPU groups;
+2 GiB and 16-rank collection still require separate qualification.

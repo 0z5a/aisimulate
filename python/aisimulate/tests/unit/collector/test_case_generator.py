@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import pytest
+
 from collector import case_generator
 from collector.case_generator import get_attention_head_configs, get_common_moe_test_cases, get_sglang_moe_backend
 
@@ -59,3 +60,50 @@ def test_qwen38_fp8_recipe_pins_only_blackwell_moe_runner(monkeypatch):
     for sm_version in (100, 103):
         assert {get_sglang_moe_backend(case, "fp8_block", sm_version) for case in cases} == {"flashinfer_trtllm"}
         assert {get_sglang_moe_backend(case, "bfloat16", sm_version) for case in cases} == {"triton"}
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
+@pytest.mark.parametrize("model", ["nvidia/GLM-5.2-NVFP4", "nvidia/Qwen3.5-397B-A17B-NVFP4"])
+def test_moe_agentic_token_anchors_keep_existing_shapes_and_parallelism(monkeypatch, backend, model):
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", model)
+    cases = get_common_moe_test_cases(backend=backend)
+    legacy_tokens = [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        48,
+        64,
+        80,
+        96,
+        128,
+        160,
+        192,
+        256,
+        320,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        3072,
+        4096,
+        6144,
+        8192,
+        12288,
+        16384,
+    ]
+
+    assert cases
+    for case in cases:
+        assert case.model_name == model
+        assert case.num_tokens_list == legacy_tokens + [32768, 65536]
+        assert case.num_experts % case.ep == 0
+        assert case.inter_size % case.tp == 0
+        if backend == "vllm":
+            assert case.tp == 1 or case.ep == 1
+    assert {case.token_expert_distribution for case in cases} == {"balanced", "power_law"}
+    assert {case.power_law_alpha for case in cases} == {0.0, 1.01, 1.2}

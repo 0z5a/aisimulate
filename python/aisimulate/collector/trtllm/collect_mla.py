@@ -241,13 +241,16 @@ def run_mla(
             f"is unsupported on SM{get_sm_version()} (attentionOp.cpp:"
             f"{'3240' if is_context_phase else '3234'} assert @1.3.0rc29)"
         )
-    scenario = Scenario()
-    if input_len + (0 if is_context_phase else 1) > scenario.max_position_embeddings:
-        raise ValueError(
-            "FIXME(kernel-limit): standalone TRT-LLM MLA uses the fixed DeepSeek Scenario RoPE table "
-            f"(collector/trtllm/collect_mla.py:Scenario); required length exceeds "
-            f"max_position_embeddings={scenario.max_position_embeddings}. Re-verify on a native collector upgrade."
+    num_generation_steps = 0 if is_context_phase else 1
+    # Synthetic table capacity, not a checkpoint context-limit override. rc29
+    # c76f4a856: attention/backends/interface.py:717,783 separates table length
+    # from YaRN scaling; trtllm.py:285,1910 grows it to the cache-manager limit.
+    # Match the manager below up front to avoid a second table allocation.
+    scenario = Scenario(
+        max_position_embeddings=max(
+            Scenario.max_position_embeddings, input_len + (num_generation_steps + 1) * output_len
         )
+    )
     q_lora_rank = scenario.q_lora_rank
     kv_lora_rank = scenario.kv_lora_rank
     qk_nope_head_dim = scenario.qk_nope_head_dim
@@ -288,8 +291,6 @@ def run_mla(
         )
 
     context_sequence_lengths = [input_len for _ in range(batch_size)]
-
-    num_generation_steps = 0 if is_context_phase else 1
 
     _run_attn_for_backend(
         "TRTLLM",

@@ -349,8 +349,9 @@ class TestGenerationMemoryManifest:
             raising=False,
         )
         manifest = mod._generation_manifest("dsa", 8, "fp8", "bfloat16", "bfloat16", "nvidia/GLM-5.2-NVFP4", "trtllm")
-        assert len(manifest) == len(set(manifest)) == 250
+        assert len(manifest) == len(set(manifest)) == 267
         assert (52, 720896, 0) in manifest
+        assert {(b, p, 0) for b in [1, 2, 4, 8, 16, 32] for p in [786432, 917504, 1048575]} <= set(manifest)
 
     def test_no_cuda_preserves_plan_without_estimating(self, monkeypatch):
         mod = _import_module()
@@ -1302,3 +1303,86 @@ class TestOrdinaryMLACli:
             assert "ALL TESTS COMPLETED" in capsys.readouterr().out
         assert len(calls) > 1
         assert all(call["ordinary_mla"] and call["is_prefill"] and call["attn_type"] == "mla" for call in calls)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("chunk_override,expected_chunk", [(None, 65536), (32768, 32768)])
+def test_dsa_native_capacity_preserves_declared_queries(monkeypatch, chunk_override, expected_chunk):
+    mod = _import_module()
+    captured = {}
+    constructed = {}
+    monkeypatch.setattr(mod, "get_context_test_cases", lambda _: [[32768, 2, 8, "fp8", "bfloat16", "bfloat16"]])
+    monkeypatch.setattr(mod, "_model_max_position_embeddings", lambda _: 1048576)
+    monkeypatch.setattr(mod, "_filter_cases_from_env", lambda cases, **_: [case for case in cases if case[3] == 524288])
+    monkeypatch.setattr(mod, "cleanup_distributed", lambda: None)
+    monkeypatch.setattr(mod, "load_model_runner", lambda **kw: constructed.update(kw) or object())
+    monkeypatch.setattr(mod, "sglang_dsa_mqa_logits_chunking_supported", lambda: True)
+    monkeypatch.setattr(mod, "run_attention_torch", lambda **kw: captured.update(kw) or len(kw["test_cases"]))
+    mod.run_mla_module(
+        "dsa",
+        8,
+        "nvidia/GLM-5.2-NVFP4",
+        "fp8",
+        "bfloat16",
+        "bfloat16",
+        True,
+        0,
+        attention_backend="dsa",
+        chunked_prefill_size=chunk_override,
+    )
+    assert captured["test_cases"] == [(2, 32768, True, 524288)]
+    assert constructed["chunked_prefill_size"] == expected_chunk
+    assert constructed["max_total_tokens"] > 2 * (32768 + 524288)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "chunk,capacity,error", [(32768, 32768, None), (16384, 32768, "new tokens"), (32768, 32767, "KV tokens")]
+)
+def test_prefill_reports_actual_capacity_without_dropping_points(chunk, capacity, error):
+    mod = _import_module()
+    runner = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(chunked_prefill_size=chunk),
+        token_to_kv_pool_allocator=types.SimpleNamespace(page_size=64, available_size=lambda: capacity),
+    )
+    if error:
+        with pytest.raises(mod.MeasurementBoundaryError, match=error):
+            mod._validate_prefill_capacity(runner, 1, 32768, 0, "dsa")
+    else:
+        mod._validate_prefill_capacity(runner, 1, 32768, 0, "dsa")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("chunk", [None, 32768, 131072])
+def test_dsa_explicit_prefill_capacity_uses_bounded_native_pool(monkeypatch, chunk):
+    mod = _import_module()
+    captured = {}
+
+    class ArgsCaptured(Exception):
+        pass
+
+    def server_args(**kwargs):
+        captured.update(kwargs)
+        raise ArgsCaptured
+
+    imports = {
+        "sglang.srt.configs.model_config": {"ModelConfig": object},
+        "sglang.srt.entrypoints.engine": {"_set_envs_and_config": lambda *_: None},
+        "sglang.srt.model_executor.model_runner": {"ModelRunner": object},
+        "sglang.srt.server_args": {"ServerArgs": server_args},
+        "sglang.srt.utils": {"suppress_other_loggers": lambda: None},
+    }
+    for name, values in imports.items():
+        monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(**values))
+    monkeypatch.setattr(mod, "_model_native_gemm_quant", lambda _: None)
+    monkeypatch.setattr(mod, "_resolve_local_model_path", lambda p: p)
+    with pytest.raises(ArgsCaptured):
+        mod.load_model_runner("test", 8, "fp8", "dsa", max_total_tokens=1000000, chunked_prefill_size=chunk)
+    assert captured["max_total_tokens"] == 1000000
+    assert captured["chunked_prefill_size"] == chunk
+    if chunk is None:
+        assert "mem_fraction_static" not in captured
+        assert "max_prefill_tokens" not in captured
+    else:
+        assert captured["mem_fraction_static"] == 0.90
+        assert captured["max_prefill_tokens"] == chunk

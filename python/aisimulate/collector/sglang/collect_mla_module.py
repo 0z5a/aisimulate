@@ -1314,11 +1314,31 @@ class CudaIllegalAccessError(RuntimeError):
 
 
 class MeasurementBoundaryError(RuntimeError):
-    """Native dispatch ran, but its module timing boundary is not qualified."""
+    """A queued point cannot use the configured native measurement boundary."""
 
 
 class PerfLogWriteError(RuntimeError):
     """Fail the subprocess when a measured row was not durably persisted."""
+
+
+def _validate_prefill_capacity(model_runner, batch_size, seq_length, prefix_len, attn_type):
+    """Reject an unexecutable point before native request/cache allocation."""
+    tokens = required_prefill_extend_tokens(batch_size, seq_length)
+    chunk_size = _runtime_chunk_size(model_runner)
+    if tokens > chunk_size:
+        raise MeasurementBoundaryError(
+            f"Prefill needs {tokens} new tokens, exceeding runtime chunked_prefill_size={chunk_size}"
+        )
+    if attn_type == "dsa":
+        capacity = _kv_pool_capacity_tokens(model_runner)
+        if capacity is not None:
+            required = required_kv_alloc_tokens(
+                batch_size, seq_length, prefix_len, kv_pool_page_size(model_runner), is_prefill=True
+            )
+            if required > capacity:
+                raise MeasurementBoundaryError(
+                    f"DSA prefill needs {required} page-rounded KV tokens, exceeding actual pool capacity={capacity}"
+                )
 
 
 def _expect_module_attr(module, attr_name: str, expected: int, module_name: str) -> None:
@@ -1454,6 +1474,18 @@ def load_model_runner(
     local_model_path = _resolve_local_model_path(model_path)
     load_quantization = {"fp8_block": "fp8", "nvfp4": "modelopt_fp4", None: None}[native_quant]
 
+    # Explicit one-shot capacity is a serving resource knob, not kernel dispatch.
+    # SGLang e00930c5 (v0.5.21), arg_groups/memory_hook.py:274-319 derives
+    # an activation reserve of 1.5 MiB per chunk token unless this is set;
+    # a 131K chunk would reserve 192 GiB even for our two-layer dummy runner.
+    # Keep the shared 90% memory budget and the shape-sized max_total_tokens;
+    # the actual native pool is checked before every prefill point. Decode
+    # keeps its existing defaults when no explicit chunk is supplied.
+    prefill_resources = (
+        {"max_prefill_tokens": chunked_prefill_size, "mem_fraction_static": 0.90}
+        if attention_backend == "dsa" and chunked_prefill_size is not None
+        else {}
+    )
     server_args = ServerArgs(
         model_path=local_model_path,
         dtype="auto",
@@ -1471,6 +1503,7 @@ def load_model_runner(
         max_total_tokens=max_total_tokens,
         chunked_prefill_size=chunked_prefill_size,
         quantization=load_quantization,
+        **prefill_resources,
     )
 
     server_args.attention_backend = attention_backend
@@ -1786,6 +1819,7 @@ def _run_prefill(
     try:
         model_runner.req_to_token_pool.clear()
         model_runner.token_to_kv_pool_allocator.clear()
+        _validate_prefill_capacity(model_runner, batch_size, seq_length, prefix_len, attn_type)
 
         prefix_indices = _alloc_prefix_indices(model_runner, batch_size, prefix_len)
         full_length = prefix_len + seq_length
@@ -1890,24 +1924,6 @@ def _run_prefill(
         if getattr(model_runner, "_aic_module_piecewise_fallback_eager", False):
             use_module_eager_dsa_context = True
         token_count = batch_size * seq_length
-        # Production chunks prefill to chunked_prefill_size; a one-shot forward with
-        # more query tokens than that needs more shared memory than the GPU has
-        # (kernel falls back to a low-smem path that illegal-memory-accesses).
-        # These (bs*seq > chunk) shapes are multi-chunk in serve; the single-chunk
-        # shape (bs*seq <= chunk) is collected separately. Skip to avoid the crash.
-        # Follow sglang: prefill is bounded only by chunked_prefill_size (sglang
-        # chunks longer prefills). FlashMLA metadata is sized by num_sm_parts
-        # (flashmla_backend.py), NOT a bs*seq shared-memory cap -- no smem limit.
-        _chunk_cap = _runtime_chunk_size(model_runner)
-        if token_count > _chunk_cap:
-            if ordinary_mla:
-                raise ValueError(f"Single module has {token_count} tokens, exceeding runtime chunk size {_chunk_cap}")
-            print(
-                f"  SKIP oversized prefill: token_count(bs*seq)={token_count} > "
-                f"chunked_prefill_size={_chunk_cap}; serve chunks this, not a one-shot shape.",
-                flush=True,
-            )
-            return 0
         # BUG (TODO: fix cuda-graph capture at large context): at large isl (e.g.
         # 16384) + prefix > 65536, the module CUDA-graph / piecewise capture
         # crashes -- "Module CUDA graph capture failed" / "RopeQuantize ... invalid
@@ -3032,42 +3048,17 @@ def run_mla_module(
         if skipped:
             print(f"[DSA] Dropped {skipped} context cases beyond DSA indexer total KV token limit")
 
-        # PRE-INIT cap: cuda graph capture tokens are computed from `cases` and the
-        # model is built (init_piecewise capture) BEFORE the old post-model chunk
-        # filter ran -> a bs*seq > chunked_prefill_size case got captured one-shot,
-        # exceeding GPU shared memory (low-smem fallback FlashMLA kernel illegal-
-        # accesses). Serve chunks prefill to chunked_prefill_size, so >chunk shapes
-        # are multi-chunk (the <=chunk shape is collected). Drop them BEFORE capture.
-        # Follow sglang: prefill is bounded by chunked_prefill_size (sglang chunks
-        # anything longer; >chunk shapes are multi-chunk in serve). FlashMLA
-        # metadata is sized by num_sm_parts (flashmla_backend.py), NOT a bs*seq
-        # shared-memory cap. Read chunked_prefill_size model-free (same GPU-mem
-        # tiering sglang's _handle_gpu_memory_settings uses).
-        try:
-            from collector.sglang.deepseekv4_sparse_modules import _sglang_chunked_prefill_size
-        except ModuleNotFoundError:
-            from deepseekv4_sparse_modules import _sglang_chunked_prefill_size
-        _chunk_cap = _sglang_chunked_prefill_size() if chunked_prefill_size is None else chunked_prefill_size
-        _before_chunk = len(cases)
-        cases = [c for c in cases if c[0] * c[1] <= _chunk_cap]
-        _dropped_chunk = _before_chunk - len(cases)
-        if _dropped_chunk:
-            print(
-                f"[DSA] pre-init dropped {_dropped_chunk} cases with bs*seq > "
-                f"chunked_prefill_size={_chunk_cap} (oversized one-shot forward crashes FlashMLA)"
-            )
-
     if not cases:
         raise RuntimeError(
             f"{attn_type.upper()} module {phase_name.lower()} has no runnable cases; "
             f"model={model_path}, heads={head_num}, kv={kv_cache_dtype}, gemm={gemm_type}"
         )
 
-    if is_prefill and attn_type == "mla" and inner_manifest and chunked_prefill_size is None:
-        # Dense MLA is queried at the complete sequence. Configure native
-        # prefill capacity for the planned one-shot forwards instead of keeping
-        # the serving default chunk (16K on Blackwell), which rejects them.
-        # Explicit diagnostic overrides and the measured DSA path are unchanged.
+    if is_prefill and (attn_type == "dsa" or inner_manifest) and chunked_prefill_size is None:
+        # Size one-shot query capacity from B*q, excluding cached prefix.
+        # SGLang e00930c5, arg_groups/memory_hook.py:92-166 preserves an
+        # explicit chunk instead of the GPU-tier default (16K on Blackwell).
+        # Keep explicit diagnostic overrides and validate them per point.
         chunked_prefill_size = max(bs * seq_len for bs, seq_len, _, _ in cases)
 
     max_total_tokens = None
@@ -3109,32 +3100,6 @@ def run_mla_module(
         )
 
         if is_prefill and attn_type == "dsa":
-            chunk_size = _runtime_chunk_size(model_runner)
-            before = len(cases)
-            cases = [
-                (bs, seq_len, ip, prefix_len)
-                for (bs, seq_len, ip, prefix_len) in cases
-                if required_prefill_extend_tokens(bs, seq_len) <= chunk_size
-            ]
-            skipped = before - len(cases)
-            print(
-                f"[DSA] SGLang runtime chunked_prefill_size={chunk_size}; "
-                f"dropped {skipped} context cases with fresh_tokens > chunked_prefill_size"
-            )
-
-            kv_capacity = _kv_pool_capacity_tokens(model_runner)
-            if kv_capacity is not None:
-                page_size = kv_pool_page_size(model_runner)
-                before = len(cases)
-                cases = [
-                    (bs, seq_len, ip, prefix_len)
-                    for (bs, seq_len, ip, prefix_len) in cases
-                    if required_kv_alloc_tokens(bs, seq_len, prefix_len, page_size, is_prefill=True) <= kv_capacity
-                ]
-                skipped = before - len(cases)
-                if skipped:
-                    print(f"[DSA] Dropped {skipped} context cases beyond actual KV pool capacity={kv_capacity} tokens")
-
             sglang_dsa_mqa_logits_chunking_supported()
             print("[DSA] SGLang MQA logits chunk path detected; no heuristic workspace pre-filter")
 

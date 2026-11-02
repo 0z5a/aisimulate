@@ -6,11 +6,13 @@
 import ast
 import os
 from contextlib import contextmanager
+from copy import deepcopy
 from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from collector.attention_memory import filter_attention_cases
 from collector.case_generator import (
     get_attention_context_shape_sweeps,
@@ -68,10 +70,28 @@ def test_shared_context_anchors_and_budgets_reach_actual_getters(monkeypatch, ba
     mha = {(c[0], c[1]) for c in cases if c[2:5] == [4, 4, 128]}
     for pairs in (gqa, mha):
         assert {(16, s) for s in (24576, 32768, 40960)} <= pairs
-        assert {(1, 262144), (2, 262144)} <= pairs
-        assert (4, 262144) not in pairs
-    assert all(c[0] * c[1] <= 655360 for c in cases)
+        assert {(16, 65536), (8, 131072), (4, 262144), (2, 524288), (1, 1048576)} <= pairs
+        assert (2, 1048576) not in pairs
+    assert all(c[0] * c[1] <= 1048576 for c in cases)
     assert all(c[0] * c[1] * c[3] * c[4] * 2 < 2147483647 for c in cases)
+    assert not any(c[:5] == [1, 1048576, 8, 8, 128] for c in cases)
+    assert all(c[0] <= 128 for c in cases if c[2] == c[3])
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
+@pytest.mark.parametrize("memory_gib", [None, 80, 267.689])
+def test_context_expansion_retains_every_previously_admitted_case(monkeypatch, backend, memory_gib):
+    monkeypatch.delenv("COLLECTOR_MODEL_PATH", raising=False)
+    ns = collector_functions(backend, memory_gib)
+    expanded = {tuple(case) for case in ns["get_context_attention_test_cases"]()}
+    old_sweeps = deepcopy(get_attention_context_shape_sweeps(backend))
+    for sweep in old_sweeps:
+        sweep["sequence_lengths"] = [s for s in sweep["sequence_lengths"] if s not in (65536, 131072, 524288, 1048576)]
+        sweep["max_tokens_self_attention"] = 655360
+        sweep["max_tokens_grouped_query_attention"] = 655360
+    ns["get_attention_context_shape_sweeps"] = lambda _backend: old_sweeps
+    previous = {tuple(case) for case in ns["get_context_attention_test_cases"]()}
+    assert previous < expanded
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])

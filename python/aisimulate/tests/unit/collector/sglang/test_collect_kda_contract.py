@@ -29,6 +29,27 @@ def test_kda_case_phases_cover_context_generation_verify():
     assert phases == {"context", "generation", "verify"}
 
 
+@pytest.mark.parametrize("backend", ["sglang", "vllm"])
+def test_kda_getters_keep_existing_widths_and_add_agentic_verifier_widths(monkeypatch, backend):
+    from collector.case_generator import get_common_kda_test_cases
+
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", "moonshotai/Kimi-K3")
+    source = SOURCE_PATH.parents[1] / backend / "collect_kda.py"
+    tree = ast.parse(source.read_text(), filename=str(source))
+    getter = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "get_kda_test_cases")
+    namespace = {"get_common_kda_test_cases": get_common_kda_test_cases}
+    exec(compile(ast.Module(body=[getter], type_ignores=[]), str(source), "exec"), namespace)
+    cases = namespace["get_kda_test_cases"]()
+
+    verify = [case for case in cases if case[0] == "verify"]
+    assert verify
+    assert {case[9] for case in cases} == {"moonshotai/Kimi-K3"}
+    assert {tuple(case[1:7]) for case in verify} == {tuple(case[1:7]) for case in cases if case[0] == "generation"}
+    for case in verify:
+        assert case[7] == [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        assert case[8] == [2, 3, 4, 5, 6, 8]
+
+
 def _exec_functions(names, namespace):
     tree = ast.parse(SOURCE_PATH.read_text(encoding="utf-8"), filename=str(SOURCE_PATH))
     body = [

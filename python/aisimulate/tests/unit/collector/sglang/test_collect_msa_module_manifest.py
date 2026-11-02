@@ -79,3 +79,43 @@ def test_worker_requires_the_manifest(monkeypatch):
             gpu_id=0,
             inner_manifest=(),
         )
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_32k_query_and_near_1m_history_preserve_msa_limits(monkeypatch, batch):
+    mod = _import_module(monkeypatch)
+    shapes = mod._context_shapes(batch, 1048576)
+    assert (32768, 1015808) in shapes
+    assert all(batch * q <= 131072 and q + p <= 1048576 for q, p in shapes)
+    assert not any(q == 32768 for q, _ in mod._context_shapes(8, 1048576))
+    generation = mod._generation_shapes(1048576)
+    assert {(b, p) for b in [1, 2, 4, 8, 16, 32] for p in [786432, 917504, 1048575]} <= set(generation)
+    assert all(b * p <= 33554432 and p < 1048576 for b, p in generation)
+
+
+def test_msa_32k_native_construction_sizes_the_planned_chunk(monkeypatch):
+    mod = _import_module(monkeypatch)
+    captured = {}
+
+    class RunnerCaptured(Exception):
+        pass
+
+    def load_runner(**kwargs):
+        captured.update(kwargs)
+        raise RunnerCaptured
+
+    monkeypatch.setattr(mod, "cleanup_distributed", lambda: None)
+    monkeypatch.setattr(mod, "load_model_runner", load_runner)
+    with pytest.raises(RunnerCaptured):
+        mod.run_msa_module(
+            8,
+            "MiniMaxAI/MiniMax-M3",
+            "bfloat16",
+            "bfloat16",
+            "bfloat16",
+            True,
+            0,
+            inner_manifest=((4, 32768, 524288),),
+        )
+    assert captured["chunked_prefill_size"] == 131072
+    assert captured["max_total_tokens"] > 4 * (32768 + 524288)

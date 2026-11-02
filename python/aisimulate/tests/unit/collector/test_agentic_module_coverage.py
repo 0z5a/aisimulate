@@ -5,6 +5,7 @@
 
 import ast
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -165,3 +166,51 @@ def test_trtllm_msa_reference_workspace_is_budgeted():
     optimized = module_footprint_bytes(case, backend="trtllm", attention_type="msa", is_context=True, page_size=128)
     reference = module_footprint_bytes(case, backend="trtllm", attention_type="msa", is_context=True, page_size=32)
     assert reference > optimized + 2 * 2**30
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
+def test_sparse_module_32k_query_grid_preserves_token_budgets(backend):
+    namespace = {
+        "get_mla_module_sweep_spec": get_mla_module_sweep_spec,
+        "_get_precision_combos": lambda *_args: [("bfloat16", "bfloat16", "bfloat16")],
+    }
+    if backend == "vllm":
+        _function(backend, "_dsa_context_budgets", namespace)
+        _function(backend, "_dsa_context_point_allowed", namespace)
+    cases = _function(backend, "get_context_test_cases", namespace)("dsa")
+    assert any(s == 32768 and b == 1 for s, b, *_ in cases)
+    sweep = get_mla_module_sweep_spec(backend)
+    budget = sweep.context_dsa_chunk_prefill_size or sweep.context_max_tokens
+    assert all(s * b <= budget for s, b, *_ in cases)
+    if backend == "vllm":
+        assert budget == 32768
+        assert all(s * b + case[-1] * b <= 1048576 for case in cases for s, b in [case[:2]])
+        assert any(s == 16384 and b == 2 for s, b, *_ in cases)
+
+
+@pytest.mark.parametrize("prefix", [0, 983040])
+def test_vllm_dsa_32k_construction_keeps_history_out_of_query_capacity(monkeypatch, prefix):
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.models.deepseek_v2",
+        SimpleNamespace(DeepseekV2MLAAttention=object),
+    )
+    captured = {}
+
+    class ConfigCaptured(Exception):
+        pass
+
+    def create_config(**kwargs):
+        captured.update(kwargs)
+        raise ConfigCaptured
+
+    namespace = {
+        "math": math,
+        "_resolve_model_path": lambda path: path,
+        "create_vllm_config": create_config,
+    }
+    constructor = _function("vllm", "_create_attention_module", namespace)
+    with pytest.raises(ConfigCaptured):
+        constructor("nvidia/GLM-5.2-NVFP4", "dsa", 8, True, prefix + 32768, 1, 32768)
+    assert captured["max_num_batched_tokens"] == 131072
+    assert captured["max_model_len"] == prefix + 32768

@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import ast
 import math
+import os
 import re
+import sys
+from argparse import ArgumentParser
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +26,47 @@ def parser():
 def test_nccl_parser_uses_exact_size_runtime_and_microseconds():
     text = "# informational time string\n512 256 half sum -1 7.5 1 1 0 7.2 1 1 0\n"
     assert parser()(text, "NCCL version 2.28.9+cuda13.0", 512, "2.28.9") == 0.0075
+
+
+@pytest.mark.parametrize("entrypoint", ["cli", "api"])
+@pytest.mark.parametrize("dtype,element_bytes", [("half", 2), ("int8", 1)])
+def test_default_sweep_reaches_one_gib_and_preserves_element_units(monkeypatch, entrypoint, dtype, element_bytes):
+    source = Path(__file__).resolve().parents[3] / "collector/network/collect_nccl.py"
+    tree = ast.parse(source.read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "nccl_benchmark")
+    main = next(n for n in tree.body if isinstance(n, ast.If))
+    sizes, rows = [], []
+
+    def run(command, **kwargs):
+        size = int(command[command.index("-b") + 1])
+        assert command[command.index("-e") + 1] == str(size)
+        assert kwargs["check"] is True
+        sizes.append(size)
+        return SimpleNamespace(
+            stdout=f"{size} {size // element_bytes} {dtype} sum -1 7.5 1 1 0 7.2 1 1 0\n",
+            stderr="NCCL version 2.28.9",
+        )
+
+    namespace = {
+        "__name__": "__main__",
+        "ArgumentParser": ArgumentParser,
+        "torch": SimpleNamespace(cuda=SimpleNamespace(get_device_name=lambda: "test GPU")),
+        "runtime_nccl_version": lambda: "2.28.9",
+        "parse_nccl_latency": parser(),
+        "log_perf": lambda **kwargs: rows.extend(kwargs["item_list"]),
+        "subprocess": SimpleNamespace(run=run),
+        "os": os,
+        "sys": sys,
+    }
+    monkeypatch.setattr(sys, "argv", [str(source), "--dtype", dtype])
+    body = [fn, main] if entrypoint == "cli" else [fn]
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), namespace)
+    if entrypoint == "api":
+        namespace[fn.name](dtype)
+
+    assert sizes == [2**exponent for exponent in range(9, 31)]
+    assert [row["message_size"] * element_bytes for row in rows] == sizes
+    assert all(row["latency"] == 0.0075 for row in rows)
 
 
 @pytest.mark.parametrize(

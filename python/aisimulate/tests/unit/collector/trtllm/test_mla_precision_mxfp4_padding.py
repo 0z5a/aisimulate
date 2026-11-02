@@ -96,8 +96,8 @@ def test_unaligned_mxfp4_honors_native_padding_window(sm, tp, quant, model_name)
         assert not namespace["RenormalizeMoeRoutingMethod"].call_args.kwargs
 
 
-@pytest.mark.parametrize("outcomes", ["fail,fail", "fail,pass", "pass,fail", "pass,pass", "fatal", "cached"])
-def test_moe_autotuning_requires_success_or_loaded_cache(outcomes):
+@pytest.mark.parametrize("outcomes", ["fail,pass", "pass,fail", "pass,pass,pass", "fatal", "cached"])
+def test_moe_autotuning_propagates_each_requested_shape_failure(outcomes):
     tree = ast.parse((COLLECTOR / "collect_moe.py").read_text())
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_run_moe_case")
     tuning = next(
@@ -125,7 +125,6 @@ def test_moe_autotuning_requires_success_or_loaded_cache(outcomes):
         ),
         "cache_loaded": outcomes == "cached",
         "num_tokens_lists": [2, 4, 8],
-        "max_tokens": 4,
         "inspect": inspect,
         "autotune": nullcontext,
         "moe": SimpleNamespace(forward=forward),
@@ -134,15 +133,17 @@ def test_moe_autotuning_requires_success_or_loaded_cache(outcomes):
         "min_latency_mode": False,
     }
     block = compile(ast.Module(body=[tuning], type_ignores=[]), "collect_moe.py", "exec")
-    if outcomes == "fail,fail":
-        with pytest.raises(RuntimeError, match="any eligible token count") as caught:
+    if "fail" in outcomes:
+        with pytest.raises(RuntimeError, match="ordinary tuning failure") as caught:
             exec(block, namespace)
-        assert caught.value.__cause__ is failure
+        assert caught.value is failure
     elif outcomes == "fatal":
         with pytest.raises(AcceleratorError) as caught:
             exec(block, namespace)
         assert caught.value is fatal
     else:
         exec(block, namespace)
-    expected_calls = 0 if outcomes == "cached" else 1 if outcomes == "fatal" else 2
+    expected_calls = 0 if outcomes == "cached" else len(outcomes.split(","))
+    if "fail" in outcomes:
+        expected_calls = outcomes.split(",").index("fail") + 1
     assert forward.call_count == expected_calls

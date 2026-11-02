@@ -40,9 +40,11 @@ Dense attention remains a CUDA-graph microbenchmark including KV writes,
 even though serving prefill may execute at a different graph boundary.
 
 The shared vLLM, SGLang and TRT-LLM context-attention defaults include
-24,576, 32,768 and 40,960-token anchors and allow 655,360 batch-times-sequence
-tokens for both MHA and grouped-query attention. This also admits the existing
-262,144-token anchor at batches 1 and 2, and larger batches at shorter lengths.
+24,576, 32,768, 40,960, 65,536, 131,072, 524,288 and 1,048,576-token
+anchors and allow 1,048,576 batch-times-sequence tokens for both MHA and
+grouped-query attention. This also admits the existing 262,144-token anchor
+at batches 1, 2 and 4, and larger batches at shorter lengths. The 1M tail
+applies only to geometry that passes the independent native/index guards.
 Agentic conversations accumulate cached history: the dense timing lookup uses
 full sequence length, then scales causal attention by
 `(full_length² - prefix_length²) / full_length²`. Full-sequence anchors therefore
@@ -80,9 +82,9 @@ measured a batch-1, 262,144-token GQA prefill at 132.734 ms per forward and
 4.461 seconds inside the collector call (11.357 seconds with process startup).
 Those eight vLLM probes passed in a 139-second allocation. They qualify that
 prior collector revision, not the newly expanded three-framework grids.
-Relative to main `e6b1fe2`, the SM103 dense grids add 39,218 vLLM, 38,785
-SGLang and 46,464 TRT-LLM cases before memory admission. At an assumed five
-steady-state seconds per added case, that is 54.47, 53.87 and 64.53 GPU-hours.
+Relative to baseline `e6b1fe2`, the SM103 dense grids add 47,630 vLLM, 48,076
+SGLang and 58,119 TRT-LLM cases before memory admission. At an assumed five
+steady-state seconds per added case, that is 66.15, 66.77 and 80.72 GPU-hours.
 This is an arithmetic planning scenario, not a measured forecast or bound;
 long-history initialization, quadratic prefill and workspace growth can make
 new cases much slower. It excludes module grids, queue and cold worker setup.
@@ -90,7 +92,8 @@ The measured two-group GLM/SGLang campaign took 1.213 GPU-hours for 500 rows;
 its added 96 shapes per group accounted for about 30.1 minutes per group,
 mostly history seeding. That is within-run attribution, not a controlled
 before/after comparison. Current native qualification and fuller cost estimates
-are reported in PR #664; raw campaign evidence remains local.
+are described in [Agentic workload coverage](cases/agentic_coverage.md); raw
+campaign evidence remains local.
 
 MLA has a separate full-history context axis,
 `common_case_values.mla_module.mla_context_sequence_lengths`, and a
@@ -103,9 +106,13 @@ a native backend or the model's positional limit supports it.
 
 Generic attention coverage does not establish complete AgentX coverage for
 model-specific sparse families. DeepSeek-V4/V4.1 and GLM-5.3-Flash have separate
-history/concurrency grids and need their own native qualification. Fused MoE
-may need more computed-token anchors when attention DP aggregates multiple
-ranks. GEMM, quantization and recurrent GDN/KDA/Mamba operations use newly
+history/concurrency grids and need their own native qualification. Shared
+fused-MoE defaults include 32K/64K computed-token anchors for attention-DP
+gathering; TRT WideEP inherits the same global-token list. TRT ordinary MoE
+executes its requested sweep or fails the grouped task rather than silently
+shrinking it. KDA verification adds widths 3/5/6, and the default NCCL byte
+sweep reaches 1 GiB. These declarations still need matching native geometry,
+precision and topology. GEMM, quantization and recurrent GDN/KDA/Mamba operations use newly
 computed tokens; cached conversation history alone does not justify increasing
 those token axes. Audit the actual queried shapes before enlarging them.
 
