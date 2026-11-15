@@ -104,6 +104,22 @@ requests by descending output length and then ascending prompt length, retracts
 from the end, and evicts unused cache toward a 20-token reserve per survivor.
 These contracts follow [SGLang v0.5.20](https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e).
 
+### SGLang simulator storage
+
+Waiting-queue admission reserves the request's host-side page-ID vector for its
+bounded prompt-plus-output target, including a partial final page. Chunked
+prefill also reserves spare capacity on a private radix leaf when it can extend
+in place. The leaf releases unused capacity when it gains a child or its last
+holder exits. Shared leaves, HiCache edges, and sliding-window cache boundaries
+cannot extend in place and do not receive this tail reservation.
+
+Disaggregated destination activation takes ownership of the transferred prompt's
+page vector and retains amortized growth during decode. It does not run chunked
+prefill or promise completion-sized page-list capacity. In ordinary decode the
+radix cache receives the prompt at running admission and the output at terminal
+cleanup, rather than extending a leaf after every token. These host allocation
+choices do not reserve simulated GPU pages or change predicted serving times.
+
 ### SGLang decode radix cache
 
 An SGLang decode server runs a chunk cache unless it is launched with
