@@ -344,7 +344,7 @@ impl StateSpaceTable {
         head_v_dim: u32,
         mamba_ssm_dtype: &str,
         sol: &dyn Fn(f64, f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
+    ) -> Result<Option<LeafValue>, AicError> {
         let causal_conv = matches!(kernel_source, "causal_conv1d_fn" | "causal_conv1d_update");
         let flashinfer_physical = kernel_source == "flashinfer_gated_delta_rule_decode";
         let flashinfer_bf16_query = self.sglang_sm100_gdn_flashinfer_lane
@@ -365,11 +365,7 @@ impl StateSpaceTable {
                 && !requires_flashinfer_alias
                 && !exact_flashinfer_query)
         {
-            return Err(AicError::PerfDatabase(format!(
-                "GDN state-sensitive silicon row is not keyed by mamba_ssm_dtype; \
-                 refusing kernel_source={kernel_source}, phase={phase}, \
-                 mamba_ssm_dtype={mamba_ssm_dtype}"
-            )));
+            return Ok(None);
         }
 
         let grids = self.load_gdn()?;
@@ -384,8 +380,9 @@ impl StateSpaceTable {
             head_v_dim,
         };
         // Mirror Python `_query_gdn_table`: exact geometry (or an exact
-        // physical-alias hit) only; any miss surfaces as `PerfDatabase` so
-        // the operator degrades to SOL.
+        // physical-alias hit) only. A miss is `Ok(None)` with no message: the
+        // operator prices it at SOL, and a slice the table does not ship
+        // misses on every query.
         //
         // The framework's own persisted physical kernels (see
         // `GdnAliasProfile`: vLLM >= 0.24.0 context-scan labels, TRT-LLM
@@ -455,21 +452,17 @@ impl StateSpaceTable {
                 // formula use two-byte state, so beyond-range util-hold stays on
                 // the correct byte model.
                 let (_, node) = best_aliases[0];
-                return engine_query(node, phase, batch_size, seq_len, sol);
+                return engine_query(node, phase, batch_size, seq_len, sol).map(Some);
             }
         }
         if requires_flashinfer_alias {
-            return Err(missing(
-                "GDN FlashInfer BF16 alias",
-                &self.data_root,
-                format!("{key:?}"),
-            ));
+            return Ok(None);
         }
         let node = match logical {
             Some((_, node)) => node,
-            None => return Err(missing("GDN", &self.data_root, format!("{key:?}"))),
+            None => return Ok(None),
         };
-        engine_query(node, phase, batch_size, seq_len, sol)
+        engine_query(node, phase, batch_size, seq_len, sol).map(Some)
     }
 
     /// KDA (Kimi Delta Attention) latency for a layer instance. Same engine
@@ -494,7 +487,7 @@ impl StateSpaceTable {
         num_v_heads: u32,
         head_v_dim: u32,
         sol: &dyn Fn(f64, f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
+    ) -> Result<Option<LeafValue>, AicError> {
         let grids = self.load_kda()?;
         let key = KdaKey {
             kernel_source: kernel_source.to_string(),
@@ -509,8 +502,8 @@ impl StateSpaceTable {
         // Mirror Python `_query_kda_table`: on exact-shape miss, fall back to
         // any same-d_model entry within the SAME kernel source and phase,
         // breaking ties by minimum `|num_v_heads - query.num_v_heads|`.
-        // Surface as `PerfDatabase` if no d_model match exists so the
-        // operator's SOL fallback fires.
+        // `Ok(None)` with no message if no d_model match exists: the operator
+        // prices it at SOL, and a model without rows misses on every query.
         let node = match grids.by_keys.get(&key) {
             Some(node) => node,
             None => {
@@ -525,11 +518,11 @@ impl StateSpaceTable {
                     .min_by_key(|(k, _)| (k.num_v_heads as i64 - key.num_v_heads as i64).abs());
                 match nearest {
                     Some((_, node)) => node,
-                    None => return Err(missing("KDA", &self.data_root, format!("{key:?}"))),
+                    None => return Ok(None),
                 }
             }
         };
-        engine_query(node, phase, batch_size, seq_len, sol)
+        engine_query(node, phase, batch_size, seq_len, sol).map(Some)
     }
 
     fn load_mamba2(&self) -> Result<&Mamba2Grids, AicError> {
@@ -1100,7 +1093,7 @@ mod tests {
         kernel_source: &str,
         phase: &str,
         num_v_heads: u32,
-    ) -> Result<f64, AicError> {
+    ) -> Option<f64> {
         // Default state dtype (every bundled Qwen3.5/3.6 config pins
         // float32); the flashinfer-lane tests below pass "bfloat16"
         // explicitly via query_gdn_test_shape_with_dtype.
@@ -1113,7 +1106,18 @@ mod tests {
         phase: &str,
         num_v_heads: u32,
         mamba_ssm_dtype: &str,
-    ) -> Result<f64, AicError> {
+    ) -> Option<f64> {
+        query_gdn_result(table, kernel_source, phase, num_v_heads, mamba_ssm_dtype).unwrap()
+    }
+
+    /// `Ok(None)` is a miss; the ambiguity tests read the error.
+    fn query_gdn_result(
+        table: &StateSpaceTable,
+        kernel_source: &str,
+        phase: &str,
+        num_v_heads: u32,
+        mamba_ssm_dtype: &str,
+    ) -> Result<Option<f64>, AicError> {
         table
             .query_gdn(
                 kernel_source,
@@ -1129,7 +1133,7 @@ mod tests {
                 mamba_ssm_dtype,
                 &dummy_sol,
             )
-            .map(|v| v.latency)
+            .map(|v| v.map(|v| v.latency))
     }
 
     #[test]
@@ -1225,7 +1229,7 @@ mod tests {
                     48,
                     dtype
                 )
-                .is_err()
+                .is_none()
             );
         }
     }
@@ -1256,7 +1260,9 @@ mod tests {
                 version,
                 &[("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0)],
             );
-            assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+            assert!(
+                query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none()
+            );
         }
         // TRT-LLM rc20 and SGLang 0.5.14 persisted the logical names: a
         // FlashInfer / fused-conv label in their tables could only be a donor.
@@ -1265,7 +1271,7 @@ mod tests {
             "1.3.0rc20",
             &[("chunk_gated_delta_rule_flashinfer", "context", 48, 2.0)],
         );
-        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
         let table = in_memory_gdn_table(
             "sglang",
             "0.5.14",
@@ -1276,7 +1282,7 @@ mod tests {
                 2.0,
             )],
         );
-        assert!(query_gdn_test_shape(&table, "causal_conv1d_update", "generation", 48).is_err());
+        assert!(query_gdn_test_shape(&table, "causal_conv1d_update", "generation", 48).is_none());
     }
 
     #[test]
@@ -1459,7 +1465,7 @@ mod tests {
                 ("chunk_gated_delta_rule_triton", "context", 48, 3.0),
             ],
         );
-        match query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48) {
+        match query_gdn_result(&table, "chunk_gated_delta_rule", "context", 48, "float32") {
             Err(AicError::PerfDatabase(message)) => {
                 assert!(message.contains("ambiguous GDN physical kernels"));
                 assert!(message.contains("chunk_gated_delta_rule_flashinfer"));
@@ -1523,7 +1529,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48),
+            query_gdn_result(&table, "chunk_gated_delta_rule", "context", 48, "float32"),
             Err(AicError::PerfDatabase(message)) if message.contains("ambiguous GDN physical kernels")
         ));
     }
@@ -1630,7 +1636,7 @@ mod tests {
             "0.5.14",
             &[("flashinfer_chunk_gated_delta_rule", "context", 48, 2.0)],
         );
-        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
     }
 
     #[test]
@@ -1640,7 +1646,7 @@ mod tests {
             "0.24.0",
             &[("chunk_gated_delta_rule_flashinfer", "context", 32, 2.0)],
         );
-        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
     }
 
     #[test]
@@ -1656,7 +1662,7 @@ mod tests {
                 ("chunk_gated_delta_rule", "context", 64, 5.0),
             ],
         );
-        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_err());
+        assert!(query_gdn_test_shape(&table, "chunk_gated_delta_rule", "context", 48).is_none());
     }
 
     /// Like `in_memory_gdn_table`, but threads an explicit `sm_version`
@@ -1790,7 +1796,7 @@ mod tests {
                     48,
                     dtype
                 )
-                .is_err()
+                .is_none()
             );
         }
     }
@@ -1818,7 +1824,7 @@ mod tests {
                 48,
                 "bfloat16"
             )
-            .is_err()
+            .is_none()
         );
     }
 
@@ -1861,7 +1867,7 @@ mod tests {
                     48,
                     dtype
                 )
-                .is_err()
+                .is_none()
             );
         }
     }
@@ -1907,7 +1913,7 @@ mod tests {
         kernel_source: &str,
         phase: &str,
         num_v_heads: u32,
-    ) -> Result<f64, AicError> {
+    ) -> Option<f64> {
         table
             .query_kda(
                 kernel_source,
@@ -1922,6 +1928,7 @@ mod tests {
                 128,
                 &dummy_sol,
             )
+            .unwrap()
             .map(|v| v.latency)
     }
 
@@ -1970,7 +1977,7 @@ mod tests {
         // querying the logical name against physical-only rows must miss
         // (the SOL byte model in the operator handles those names instead).
         let table = in_memory_kda_table(&[("chunk_kda_with_fused_gate", "context", 16, 2.0)]);
-        assert!(query_kda_test_shape(&table, "chunk_kda", "context", 16).is_err());
+        assert!(query_kda_test_shape(&table, "chunk_kda", "context", 16).is_none());
     }
 
     #[test]
@@ -2018,7 +2025,7 @@ mod tests {
         );
         eprintln!("query: {r:?}");
         assert!(r.is_ok(), "expected silicon lookup to succeed: {r:?}");
-        let latency = r.unwrap().latency;
+        let latency = r.unwrap().unwrap().latency;
         assert!(latency > 0.0, "non-zero latency: {latency}");
         eprintln!("latency: {latency}");
     }
@@ -2074,6 +2081,7 @@ mod tests {
                 "float32",
                 &dummy_sol,
             )
+            .unwrap()
             .unwrap();
         assert!((v.latency - 2.0).abs() < 1e-9, "latency {}", v.latency);
         assert!(
