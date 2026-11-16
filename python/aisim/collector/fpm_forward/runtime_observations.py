@@ -8,6 +8,12 @@ sliding-window or fixed-state groups. Runtime mappings are evidence: the importe
 rechecks raw geometry, configuration, physical views, and pool accounting itself.
 
 vLLM 0.27/0.28 name the layers sharing each allocation slot (``shared_by``).
+An explicit nonzero ``block_stride`` can place projected layer allocations in
+one backing buffer. The declared page width, including padding, must fit the
+stride, and ``offset + (num_blocks - 1) * block_stride + page_width`` must fit
+the storage. Allocations on one storage must use the same stride; their repeated
+page intervals must not overlap, except for aliases within one ``shared_by``.
+Zero stride retains the unpacked, zero-offset, single-allocation storage rules.
 vLLM 0.32 places a group's layers in one backing buffer at
 ``offset + layer * layer_stride + block * block_stride``; vLLM 0.33 uses its
 separate audited hybrid mapping.
@@ -993,7 +999,7 @@ def _shared_slot_allocations(
     count: int,
     precision: str,
 ) -> tuple[set[str], set[str]]:
-    """vLLM 0.27/0.28 plan: each allocation slot is shared by layers of distinct groups."""
+    """Validate projected layer allocations, with aliases declared only inside ``shared_by``."""
     covered: set[str] = set()
     used_storage: set[str] = set()
     intervals: dict[str, list[tuple[int, int]]] = {}
@@ -1008,16 +1014,25 @@ def _shared_slot_allocations(
         stride = _nonnegative(allocation.get("block_stride"), "allocation block stride")
         offset = _nonnegative(allocation.get("offset"), "allocation byte offset")
         slot = storages[storage_id]["size_bytes"] // count
-        if (stride and stride != slot) or (not stride and (offset or storage_id in used_storage)):
+        if not stride and (offset or storage_id in used_storage):
             raise ValueError("allocation has an unsupported packed stride or undeclared storage alias")
         if storage_id in packing and packing[storage_id] != stride:
             raise ValueError("packed and unpacked allocations alias one storage")
         packing[storage_id] = stride
         width = max(layer_groups[name][1]["spec_page_size_bytes"] for name in names)
-        if offset + width > slot:
+        if width > (stride or slot):
             raise ValueError("allocation page bytes exceed the physical storage slot")
+        if offset + (count - 1) * stride + width > storages[storage_id]["size_bytes"]:
+            raise ValueError("allocation page bounds exceed the backing storage")
         for lower, upper in intervals.setdefault(storage_id, []):
-            if offset < upper and lower < offset + width:
+            # Explicit strides also describe layer-outer buffers: each layer's
+            # offset may span many pool blocks. Compare all repeating pages,
+            # including padding, without enumerating the block count. Pages b
+            # and b+d overlap iff -other_width < delta+d*stride < width.
+            delta = lower - offset
+            low = max((-(upper - lower) - delta) // stride + 1, 1 - count)
+            high = min(-((delta - width) // stride) - 1, count - 1)
+            if low <= high:
                 raise ValueError("packed allocation page intervals overlap")
         intervals[storage_id].append((offset, offset + width))
         views = []
