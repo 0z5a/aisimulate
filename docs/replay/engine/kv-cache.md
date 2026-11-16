@@ -753,11 +753,10 @@ Rejected: `recommend`, G2/G3 offload, and speculative decoding with sub-block
 ## Agentic traffic with G2
 
 AgentX snapshot, warmup and continuous-profile traffic supports G2 on vLLM with
-aggregated or prefill/decode pools with any positive integer worker count, all
-with `attention_data: 1` and static workers. Without speculation, either G2 scope
-works. Canonical MTP additionally supports a single aggregated worker with local
-G2 and prefix caching, within the [combined scope](#supported) above. Other
-speculation and G3 are not supported. When the replay composition captures engine
+static aggregated or prefill/decode workers of any count and `attention_data`,
+with either G2 scope. A role may omit G2. Each role uses canonical MTP, within
+the [combined scope](#supported) above, or no speculation. G3 is not supported.
+When the replay composition captures engine
 KV events, each worker publishes its G2 residency as native `HostPinned` events,
 so a KV-aware placement policy can follow a G2-resident prefix to its owner, or
 to any replica of a `cluster_shared` pool. The built-in round-robin composition
