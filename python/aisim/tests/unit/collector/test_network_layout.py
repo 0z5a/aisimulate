@@ -169,8 +169,9 @@ def _run_collect_comm_with_fake_tools(
     cuda_visible_devices: str | None,
     *,
     cuda_device_count: int = 0,
+    cuda_query_fails: bool = False,
     expected_returncode: int = 0,
-) -> tuple[str, list[str]]:
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Run collect_comm.sh with fake device counts and a recording torchrun."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -180,8 +181,10 @@ def _run_collect_comm_with_fake_tools(
     for tool in bin_dir.iterdir():
         tool.chmod(0o755)
     (bin_dir / "python3").symlink_to(sys.executable)
+    query_body = "raise RuntimeError('CUDA count query failed')" if cuda_query_fails else f"return {cuda_device_count}"
     (tmp_path / "torch.py").write_text(
-        f"from types import SimpleNamespace\ncuda = SimpleNamespace(device_count=lambda: {cuda_device_count})\n"
+        f"from types import SimpleNamespace\ndef device_count():\n    {query_body}\n"
+        "cuda = SimpleNamespace(device_count=device_count)\n"
     )
 
     env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(tmp_path)}
@@ -194,36 +197,43 @@ def _run_collect_comm_with_fake_tools(
         env=env,
     )
     assert result.returncode == expected_returncode, result.stdout + result.stderr
-    return result.stdout, calls.read_text().split() if calls.exists() else []
+    return result, calls.read_text().split() if calls.exists() else []
 
 
 def test_collect_comm_counts_all_gpus_without_cuda_visible_devices(tmp_path):
-    stdout, calls = _run_collect_comm_with_fake_tools(tmp_path, None)
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, None)
     # BSD wc pads its count with spaces.
-    assert re.search(r"Found\s+8 GPUs\.", stdout)
+    assert re.search(r"Found\s+8 GPUs\.", result.stdout)
     assert calls == ["--nproc_per_node=2", "--nproc_per_node=4", "--nproc_per_node=8"]
 
 
 def test_collect_comm_honors_cuda_visible_devices(tmp_path):
     # nvidia-smi lists every GPU on the node regardless of CUDA_VISIBLE_DEVICES;
     # on a node shared with other jobs the collector must stay on its own GPUs.
-    stdout, calls = _run_collect_comm_with_fake_tools(tmp_path, "4,5,6,7", cuda_device_count=4)
-    assert re.search(r"Found\s+4 GPUs\.", stdout)
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "4,5,6,7", cuda_device_count=4)
+    assert re.search(r"Found\s+4 GPUs\.", result.stdout)
     assert calls == ["--nproc_per_node=2", "--nproc_per_node=4"]
 
 
 def test_collect_comm_uses_effective_cuda_device_count(tmp_path):
     # An invalid ordinal stops CUDA enumeration before later mask entries.
-    stdout, calls = _run_collect_comm_with_fake_tools(tmp_path, "0,1,-1,2", cuda_device_count=2)
-    assert re.search(r"Found\s+2 GPUs\.", stdout)
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "0,1,-1,2", cuda_device_count=2)
+    assert re.search(r"Found\s+2 GPUs\.", result.stdout)
     assert calls == ["--nproc_per_node=2"]
 
 
 @pytest.mark.parametrize(("cuda_visible_devices", "cuda_device_count"), [("", 0), ("6", 1)])
 def test_collect_comm_rejects_fewer_than_two_visible_gpus(tmp_path, cuda_visible_devices, cuda_device_count):
-    stdout, calls = _run_collect_comm_with_fake_tools(
+    result, calls = _run_collect_comm_with_fake_tools(
         tmp_path, cuda_visible_devices, cuda_device_count=cuda_device_count, expected_returncode=1
     )
-    assert re.search(rf"Found\s+{cuda_device_count} GPUs\.", stdout)
-    assert "Error: single GPU detected." in stdout
+    assert re.search(rf"Found\s+{cuda_device_count} GPUs\.", result.stdout)
+    assert "Error: single GPU detected." in result.stdout
+    assert calls == []
+
+
+def test_collect_comm_aborts_when_cuda_count_query_fails(tmp_path):
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "4,5,6,7", cuda_query_fails=True, expected_returncode=1)
+    assert "RuntimeError: CUDA count query failed" in result.stderr
+    assert not re.search(r"Found\s+.* GPUs\.", result.stdout)
     assert calls == []
