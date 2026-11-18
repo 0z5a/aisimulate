@@ -3,6 +3,7 @@
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -163,8 +164,14 @@ def test_advertised_default_worlds_expand_to_at_least_one_case(monkeypatch):
         assert ata.get_default_test_cases(world), f"trtllm alltoall default world {world} expanded to zero cases"
 
 
-def _run_collect_comm_with_fake_tools(tmp_path: Path, cuda_visible_devices: str | None) -> tuple[str, list[str]]:
-    """Run collect_comm.sh against a fake 8-GPU nvidia-smi and a recording torchrun."""
+def _run_collect_comm_with_fake_tools(
+    tmp_path: Path,
+    cuda_visible_devices: str | None,
+    *,
+    cuda_device_count: int = 0,
+    expected_returncode: int = 0,
+) -> tuple[str, list[str]]:
+    """Run collect_comm.sh with fake device counts and a recording torchrun."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     calls = tmp_path / "torchrun_calls.txt"
@@ -172,8 +179,12 @@ def _run_collect_comm_with_fake_tools(tmp_path: Path, cuda_visible_devices: str 
     (bin_dir / "torchrun").write_text(f'#!/bin/bash\necho "$1" >> "{calls}"\n')
     for tool in bin_dir.iterdir():
         tool.chmod(0o755)
+    (bin_dir / "python3").symlink_to(sys.executable)
+    (tmp_path / "torch.py").write_text(
+        f"from types import SimpleNamespace\ncuda = SimpleNamespace(device_count=lambda: {cuda_device_count})\n"
+    )
 
-    env = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(tmp_path)}
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     result = subprocess.run(
@@ -182,8 +193,8 @@ def _run_collect_comm_with_fake_tools(tmp_path: Path, cuda_visible_devices: str 
         text=True,
         env=env,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return result.stdout, calls.read_text().split()
+    assert result.returncode == expected_returncode, result.stdout + result.stderr
+    return result.stdout, calls.read_text().split() if calls.exists() else []
 
 
 def test_collect_comm_counts_all_gpus_without_cuda_visible_devices(tmp_path):
@@ -196,6 +207,23 @@ def test_collect_comm_counts_all_gpus_without_cuda_visible_devices(tmp_path):
 def test_collect_comm_honors_cuda_visible_devices(tmp_path):
     # nvidia-smi lists every GPU on the node regardless of CUDA_VISIBLE_DEVICES;
     # on a node shared with other jobs the collector must stay on its own GPUs.
-    stdout, calls = _run_collect_comm_with_fake_tools(tmp_path, "4,5,6,7")
+    stdout, calls = _run_collect_comm_with_fake_tools(tmp_path, "4,5,6,7", cuda_device_count=4)
     assert re.search(r"Found\s+4 GPUs\.", stdout)
     assert calls == ["--nproc_per_node=2", "--nproc_per_node=4"]
+
+
+def test_collect_comm_uses_effective_cuda_device_count(tmp_path):
+    # An invalid ordinal stops CUDA enumeration before later mask entries.
+    stdout, calls = _run_collect_comm_with_fake_tools(tmp_path, "0,1,-1,2", cuda_device_count=2)
+    assert re.search(r"Found\s+2 GPUs\.", stdout)
+    assert calls == ["--nproc_per_node=2"]
+
+
+@pytest.mark.parametrize(("cuda_visible_devices", "cuda_device_count"), [("", 0), ("6", 1)])
+def test_collect_comm_rejects_fewer_than_two_visible_gpus(tmp_path, cuda_visible_devices, cuda_device_count):
+    stdout, calls = _run_collect_comm_with_fake_tools(
+        tmp_path, cuda_visible_devices, cuda_device_count=cuda_device_count, expected_returncode=1
+    )
+    assert re.search(rf"Found\s+{cuda_device_count} GPUs\.", stdout)
+    assert "Error: single GPU detected." in stdout
+    assert calls == []

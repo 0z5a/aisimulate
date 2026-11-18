@@ -94,12 +94,8 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 if [[ "$device" == "cuda" ]]; then
     if [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
-        # nvidia-smi ignores CUDA_VISIBLE_DEVICES; count the visible entries instead.
-        IFS=',' read -ra _visible_gpus <<< "$CUDA_VISIBLE_DEVICES"
-        GPU_COUNT=0
-        for _gpu in "${_visible_gpus[@]}"; do
-            [[ -n "${_gpu// /}" ]] && GPU_COUNT=$((GPU_COUNT + 1))
-        done
+        # CUDA can enumerate fewer devices than the visibility mask contains.
+        GPU_COUNT=$(python3 -c 'import torch; print(torch.cuda.device_count())') || exit 1
     else
         GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
     fi
