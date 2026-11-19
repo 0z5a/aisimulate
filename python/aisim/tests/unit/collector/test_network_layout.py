@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -187,7 +189,9 @@ def _run_collect_comm_with_fake_tools(
         "cuda = SimpleNamespace(device_count=device_count)\n"
     )
 
-    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(tmp_path)}
+    # Keep the active interpreter's runtime paths (for example LD_LIBRARY_PATH).
+    env = {**os.environ, "PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(tmp_path)}
+    env.pop("CUDA_VISIBLE_DEVICES", None)
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     result = subprocess.run(
@@ -200,7 +204,8 @@ def _run_collect_comm_with_fake_tools(
     return result, calls.read_text().split() if calls.exists() else []
 
 
-def test_collect_comm_counts_all_gpus_without_cuda_visible_devices(tmp_path):
+def test_collect_comm_counts_all_gpus_without_cuda_visible_devices(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
     result, calls = _run_collect_comm_with_fake_tools(tmp_path, None)
     # BSD wc pads its count with spaces.
     assert re.search(r"Found\s+8 GPUs\.", result.stdout)
@@ -218,6 +223,30 @@ def test_collect_comm_honors_cuda_visible_devices(tmp_path):
 def test_collect_comm_uses_effective_cuda_device_count(tmp_path):
     # An invalid ordinal stops CUDA enumeration before later mask entries.
     result, calls = _run_collect_comm_with_fake_tools(tmp_path, "0,1,-1,2", cuda_device_count=2)
+    assert re.search(r"Found\s+2 GPUs\.", result.stdout)
+    assert calls == ["--nproc_per_node=2"]
+
+
+def test_collect_comm_preserves_python_runtime_environment(tmp_path, monkeypatch):
+    # setup-python's shared interpreter needs LD_LIBRARY_PATH on ARM64 CI.
+    # Model that requirement even when the local interpreter has an rpath.
+    runtime_library_path = os.pathsep.join(
+        filter(None, (str(tmp_path / "python-lib"), os.environ.get("LD_LIBRARY_PATH")))
+    )
+    launcher = tmp_path / "python-with-runtime-env"
+    launcher.write_text(
+        f'#!/bin/bash\nif [[ "${{LD_LIBRARY_PATH:-}}" != {shlex.quote(runtime_library_path)} ]]; then\n'
+        "    echo 'Missing Python runtime library path' >&2\n"
+        "    exit 127\n"
+        "fi\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    launcher.chmod(0o755)
+    monkeypatch.setenv("LD_LIBRARY_PATH", runtime_library_path)
+    monkeypatch.setattr(sys, "executable", str(launcher))
+
+    result, calls = _run_collect_comm_with_fake_tools(tmp_path, "0,1", cuda_device_count=2)
+
     assert re.search(r"Found\s+2 GPUs\.", result.stdout)
     assert calls == ["--nproc_per_node=2"]
 
