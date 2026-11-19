@@ -371,13 +371,13 @@ fn validate_public_agentic_engine(
         "agentic replay does not combine with an encoder pool"
     );
     let roles = match &spec.topology {
-        ReplayTopology::Aggregated { .. } => vec![aggregated_role(engine)],
+        ReplayTopology::Aggregated { .. } => vec![("aggregated", aggregated_role(engine))],
         ReplayTopology::Disaggregated { .. } => vec![
-            engine.role(crate::replay::WorkerStage::Prefill),
-            engine.role(crate::replay::WorkerStage::Decode),
+            ("prefill", engine.role(crate::replay::WorkerStage::Prefill)),
+            ("decode", engine.role(crate::replay::WorkerStage::Decode)),
         ],
     };
-    for role in &roles {
+    for (_, role) in &roles {
         ensure!(
             role.rank.g3_offload.is_none(),
             "agentic replay does not support G3 offload"
@@ -387,32 +387,29 @@ fn validate_public_agentic_engine(
             "agentic replay supports only vLLM and SGLang backends"
         );
     }
-    // HBM-only deployments retain their existing worker/DP support. Once any
-    // active role enables G2, qualify the entire deployment, not just that rank.
+    // Once any role enables G2 these checks apply to every role, also one
+    // without G2. The preparation barrier, deadlines and telemetry cover every
+    // worker, rank and pool client, so any static fleet qualifies.
     if roles
         .iter()
-        .any(|role| role.rank.native_host_offload.is_some())
+        .any(|(_, role)| role.rank.native_host_offload.is_some())
     {
-        // Without speculation, placement consumes each worker's native
-        // G2 KV events, and per-play token namespaces keep G2 identities play-local.
         ensure!(
             spec.adapters.scaling.provider == "none",
             "agentic host offload requires static worker pools without a scaling policy"
         );
-        for role in &roles {
+        for (name, role) in &roles {
             ensure!(
                 role.rank.aic_nextn.is_none()
-                    || (matches!(&spec.topology, ReplayTopology::Aggregated { workers } if workers.initial_workers == 1)
-                        && role.rank.has_canonical_mtp_timing()),
-                "agentic host offload requires speculative decoding disabled except canonical MTP on an aggregated worker"
+                    || role.rank.has_canonical_mtp_timing()
+                    || (role.rank.state_cache.is_some() && role.rank.disable_eagle_block_drop),
+                "agentic host offload requires canonical mtp speculation or speculative \
+                 decoding disabled on the {name} role, or MTP with state_cache and \
+                 disable_eagle_block_drop"
             );
             ensure!(
                 role.rank.backend == Backend::Vllm,
                 "agentic host offload requires backend=vllm on every role"
-            );
-            ensure!(
-                role.dp_size == 1,
-                "agentic host offload requires attention DP=1 on every role"
             );
         }
     }
@@ -1067,7 +1064,8 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_memo: Memo::clock(128),
+            // Per-rank phase pricing meets a new decode KV length on almost every pass.
+            phase_memo: Memo::clock(4096),
             vision,
             iteration,
         })
@@ -1078,8 +1076,9 @@ impl AicTimingModel {
     /// work the iteration query cannot describe is rejected here: a vision
     /// tower, speculative decoding other than the MTP rounds a vLLM regression
     /// was fitted to, and bounded decoder replay. Such a regression pins its
-    /// `nextn`, which the scheduler's `aic_nextn` must match. Only vLLM's
-    /// telemetry gives an MTP decode request its verification width as extend.
+    /// depth, `nextn` or an MTP scheme's, which the scheduler's `aic_nextn`
+    /// must match. Only vLLM's telemetry gives an MTP decode request its
+    /// verification width as extend.
     fn require_fitted_role(
         config: &AicTimingConfig,
         mode: EstimationMode,
@@ -1090,16 +1089,25 @@ impl AicTimingModel {
             "{} cannot time a rank hosting the vision encoder; it prices only language-model iterations",
             wire_name(mode)
         );
+        let speculation_kind = config
+            .speculation
+            .as_ref()
+            .map(|speculation| speculation.kind.as_str());
+        // Reject schemes this estimator cannot price before the SDK resolves
+        // their draft checkpoints. MTP eligibility does not need its depth.
         require_fitted_execution(
             mode,
             &config.backend,
-            config.nextn > 0,
-            config
-                .speculation
-                .as_ref()
-                .map(|speculation| speculation.kind.as_str()),
+            config.nextn > 0 || speculation_kind == Some("mtp"),
+            speculation_kind,
             config.decoder_replay,
-        )
+        )?;
+        if speculation_kind == Some("mtp") {
+            // Wait for scheme registration before canonical construction uses
+            // the base module. Executor depth is checked only after loading.
+            Python::with_gil(|py| PyModule::import(py, "aisim_core.sdk.speculation").map(|_| ()))?;
+        }
+        Ok(())
     }
 
     /// The timing model of a regression or learned estimator: latency-only,
@@ -2656,6 +2664,55 @@ fn materialize_aic_capacity(
         );
     }
     if resources.as_ref().is_some_and(|resources| {
+        resources.cache_layout == crate::perfmodel::fpm::FpmCacheLayout::MambaAlign
+    }) {
+        ensure!(
+            role.rank.enable_prefix_caching,
+            "Mamba FPM cache requires the recorded prefix caching policy"
+        );
+        ensure!(
+            role.rank.native_host_offload.is_none() && role.rank.g3_offload.is_none(),
+            "Mamba FPM cache supports HBM replay only"
+        );
+        let budget = estimate_aic_grouped_budget(config, role)?;
+        let cache = budget
+            .replay_cache
+            .context("missing canonical Mamba replay geometry")?;
+        let block_size = cache["block_size"].as_u64().context("Mamba block size")? as usize;
+        let unit = cache["prefix_match_unit"]
+            .as_u64()
+            .context("Mamba prefix unit")? as usize;
+        let token_bytes = cache["kv_cache_bytes_per_token"]
+            .as_u64()
+            .context("Mamba token bytes")? as usize;
+        let state = serde_json::from_value(cache["state_cache"].clone())?;
+        ensure!(
+            role.rank.block_size == block_size,
+            "engine block_size conflicts with measured Mamba geometry"
+        );
+        ensure!(
+            role.rank
+                .prefix_match_unit
+                .is_none_or(|value| value == unit)
+                && role
+                    .rank
+                    .kv_cache_bytes_per_token
+                    .is_none_or(|value| value == token_bytes)
+                && role.rank.state_cache.is_none_or(|value| value == state)
+                && role.rank.kv_cache_groups.is_empty()
+                && role.rank.kv_cache_capacity_bytes.is_none(),
+            "engine cache geometry conflicts with measured Mamba profile"
+        );
+        role.rank.num_gpu_blocks = cache["num_gpu_blocks"]
+            .as_u64()
+            .context("Mamba pool blocks")? as usize;
+        role.rank.prefix_match_unit = Some(unit);
+        role.rank.kv_cache_bytes_per_token = Some(token_bytes);
+        role.rank.state_cache = Some(state);
+        role.rank.validate()?;
+        return Ok(());
+    }
+    if resources.as_ref().is_some_and(|resources| {
         resources.cache_layout == crate::perfmodel::fpm::FpmCacheLayout::Grouped
     }) {
         ensure!(
@@ -3119,6 +3176,25 @@ fn resolve_role_timing(
     );
     let mut config: AicTimingConfig =
         serde_json::from_value(config).context("invalid AIC timing provider configuration")?;
+    if let Some(launch) = &role.rank.launch
+        && let Some(fit) = config
+            .estimator_request(worker_type)?
+            .estimator_config
+            .fpm_regression
+            .fit
+            .linear
+            .and_then(|linear| linear.max_cudagraph_capture_size)
+    {
+        // Both describe vLLM's max_cudagraph_capture_size: the fit prices a
+        // pass as graph or eager, and `launch` times its launch the same way.
+        ensure!(
+            usize::try_from(fit).is_ok_and(|fit| fit == launch.max_cudagraph_capture_size),
+            "scheduler.launch.max_cudagraph_capture_size ({}) differs from \
+             estimator_config.fpm_regression.fit.linear.max_cudagraph_capture_size ({fit}); \
+             both are vLLM's max_cudagraph_capture_size",
+            launch.max_cudagraph_capture_size
+        );
+    }
     let resources = if config.backend == "vllm" && config.pp == 1 {
         config.estimator_request(worker_type)?.fpm_resources()?
     } else {
@@ -5831,18 +5907,17 @@ mod tests {
                 if scope.is_none() && other.is_none() {
                     continue;
                 }
-                let mut multi_replica = pd.clone();
-                for pointer in [
-                    "/spec/topology/prefill/initial_workers",
-                    "/spec/topology/decode/initial_workers",
-                ] {
-                    *multi_replica.pointer_mut(pointer).unwrap() = serde_json::json!(2);
+                // Several workers and attention DP are qualified with G2.
+                let mut fleet = pd.clone();
+                for role in ["prefill", "decode"] {
+                    for (part, field) in [("topology", "initial_workers"), ("engine", "dp_size")] {
+                        fleet.pointer_mut(&format!("/spec/{part}/{role}")).unwrap()[field] =
+                            serde_json::json!(2);
+                    }
                 }
-                let report = run(&multi_replica);
-                assert_eq!(report["completed_requests"], 1, "{scope:?}/{other:?}");
+                let report = run(&fleet);
+                assert_eq!(report["completed_requests"], 1, "{scope:?}/{other:?} fleet");
                 for (pointer, value, message) in [
-                    ("/spec/engine/prefill/dp_size", serde_json::json!(2), "DP=1"),
-                    ("/spec/engine/decode/dp_size", serde_json::json!(2), "DP=1"),
                     (
                         "/spec/engine/prefill/rank/backend",
                         serde_json::json!("sglang"),
@@ -5856,11 +5931,7 @@ mod tests {
                     (
                         "/spec/engine/decode/rank/aic_nextn",
                         serde_json::json!(1),
-                        if other.is_some() {
-                            "requires canonical mtp"
-                        } else {
-                            "speculative decoding disabled"
-                        },
+                        "requires canonical mtp",
                     ),
                     (
                         "/spec/engine/decode/rank/g3_offload",
@@ -7557,6 +7628,262 @@ mod tests {
     }
 
     #[test]
+    fn fitted_regression_takes_an_mtp_scheme_as_its_nextn() {
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
+        identity.nextn = 2;
+        identity.estimator_config = serde_json::from_value(serde_json::json!({
+            "fpm_regression": {"fit": {"linear": {"feature_axes": ["E"]}}}
+        }))
+        .unwrap();
+        let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
+        // Synthetic observations: 2 ms plus 0.25 ms per verified token.
+        let iterations: Vec<_> = (0..32)
+            .map(|i| {
+                let lengths: Vec<usize> = (0..1 + i % 4).map(|j| 50 + 10 * (i + j)).collect();
+                let mut rank = fitted_work(0, None, Some(&lengths));
+                let decode = rank.decode.as_mut().unwrap();
+                decode.verify_width = 3;
+                decode.widths = (0..lengths.len()).map(|j| 1 + (i + 2 * j) % 3).collect();
+                let tokens: usize = decode.widths.iter().sum();
+                let query = fitted_rank_query(&rank).unwrap();
+                let mut metrics = detailed_rank_metrics(&query, &rank).unwrap();
+                metrics.wall_time = (2.0 + 0.25 * tokens as f64) / 1000.0;
+                vec![metrics]
+            })
+            .collect();
+        model.tune_with_fpms(&iterations).unwrap();
+        let mut legacy = snapshot_timing_config(&model, &dir.path().join("snapshot"));
+        let mtp = |depth: u32| {
+            let mut config = legacy.clone();
+            config.nextn = 0;
+            config.speculation = Some(
+                serde_json::from_value(
+                    serde_json::json!({"kind": "mtp", "params": {"depth": depth}}),
+                )
+                .unwrap(),
+            );
+            config
+        };
+        let (mut scheme, mut deeper) = (mtp(2), mtp(3));
+        let timing =
+            AicTimingModel::build(&mut legacy, ForwardPassWorkerType::Decode, false).unwrap();
+        let scheme_timing =
+            AicTimingModel::build(&mut scheme, ForwardPassWorkerType::Decode, false).unwrap();
+        // The scheme keeps its spelling, and every pass is priced alike.
+        assert_eq!(scheme.nextn, 0);
+        assert_eq!(scheme.speculation.as_ref().unwrap().kind, "mtp");
+        let mut rank = fitted_work(0, None, Some(&[700, 900]));
+        rank.decode.as_mut().unwrap().verify_width = 3;
+        rank.decode.as_mut().unwrap().widths = vec![3, 2];
+        // One full and one shortened round verify five tokens: 3.25 ms.
+        for timing in [&scheme_timing, &timing] {
+            let ms = iteration_ms(timing, &[rank.clone()]);
+            assert!((ms - (2.0 + 0.25 * 5.0)).abs() < 1e-9, "{ms}");
+        }
+        // A scheme of another depth is another identity.
+        let error = AicTimingModel::build(&mut deeper, ForwardPassWorkerType::Decode, false)
+            .err()
+            .expect("the snapshot was fitted at nextn 2");
+        assert!(
+            format!("{error:#}").contains("differs from the snapshot's pinned identity at nextn")
+        );
+    }
+
+    #[test]
+    fn fitted_mtp_role_takes_its_depth_from_the_scheme_with_or_without_a_cpu_tier() {
+        use crate::engine::NativeHostOffloadConfig;
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = unknown_regression_identity(ForwardPassWorkerType::Aggregated);
+        identity.nextn = 2;
+        identity.estimator_config = serde_json::from_value(serde_json::json!({
+            "fpm_regression": {"fit": {"linear": {"feature_axes": ["E"]}}}
+        }))
+        .unwrap();
+        let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
+        // Synthetic observations for all three stores: 2 ms plus 0.25 ms
+        // per scheduled token, including each request's verified drafts.
+        let mut iterations = Vec::new();
+        for i in 0..32 {
+            let lengths: Vec<usize> = (0..1 + i % 4).map(|j| 50 + 10 * (i + j)).collect();
+            let prefill = [(32 + i, 0)];
+            for mut rank in [
+                fitted_work(0, Some(&prefill), None),
+                fitted_work(0, None, Some(&lengths)),
+                fitted_work(0, Some(&prefill), Some(&lengths)),
+            ] {
+                let mut tokens = rank.prefill.as_ref().map_or(0, |p| p.totals.new_tokens);
+                if let Some(decode) = &mut rank.decode {
+                    decode.verify_width = 3;
+                    decode.widths = (0..lengths.len()).map(|j| 1 + (i + 2 * j) % 3).collect();
+                    tokens += decode.widths.iter().sum::<usize>();
+                }
+                let query = fitted_rank_query(&rank).unwrap();
+                let mut metrics = detailed_rank_metrics(&query, &rank).unwrap();
+                metrics.wall_time = (2.0 + 0.25 * tokens as f64) / 1000.0;
+                iterations.push(vec![metrics]);
+            }
+        }
+        model.tune_with_fpms(&iterations).unwrap();
+        let mut timing = serde_json::to_value(
+            model
+                .save_state_snapshot(
+                    dir.path().join("snapshot"),
+                    &crate::StateSnapshotOptions::default(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        timing["nextn"] = 0.into();
+        timing["speculation"] = serde_json::json!({"kind": "mtp", "params": {"depth": 2}});
+        for depth in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(2)),
+        ] {
+            for cpu_tier in [false, true] {
+                let mut value = serde_json::json!({
+                    "rank": {
+                        "backend": "vllm", "num_gpu_blocks": 64, "block_size": 16,
+                        "kv_cache_bytes_per_token": 250_000,
+                        "aic_nextn_accept_rates": "1,1",
+                        "timing_model": {"type": "external", "provider": "aic", "config": timing}
+                    }
+                });
+                if let Some(depth) = depth.clone() {
+                    value["rank"]["aic_nextn"] = depth;
+                }
+                if cpu_tier {
+                    value["rank"]["native_host_offload"] =
+                        serde_json::to_value(NativeHostOffloadConfig::new(4)).unwrap();
+                }
+                if depth.is_none() && cpu_tier {
+                    // Enter through the native descriptor with aic_nextn
+                    // omitted, including full engine/cache validation.
+                    let payload = serde_json::json!({
+                        "version": 1,
+                        "topology": {"kind": "aggregated", "workers": {"initial_workers": 1}},
+                        "engine": value,
+                        "requests": [{
+                            "id": "fitted-mtp-cpu", "arrival_time_ms": 0.0,
+                            "input_tokens": 32, "output_tokens": 7
+                        }],
+                        "record_per_request": true
+                    });
+                    let report: serde_json::Value =
+                        serde_json::from_str(&execute_json(&payload.to_string(), false).unwrap())
+                            .unwrap();
+                    assert_eq!(report["completed_requests"], 1);
+                    assert_eq!(report["total_output_tokens"], 7);
+                    assert_eq!(report["per_request"][0]["request_id"], "fitted-mtp-cpu");
+                    let request = &report["per_request"][0];
+                    let decode_ms = request["last_token_ms"].as_f64().unwrap()
+                        - request["first_token_ms"].as_f64().unwrap();
+                    // Prefill emits one token; two width-three decode passes
+                    // emit the remaining six: 2 * (2 + 0.25 * 3) = 5.5 ms.
+                    assert!((decode_ms - 5.5).abs() < 1e-9, "{decode_ms}");
+                }
+                let mut role: ReplayRoleConfig = serde_json::from_value(value).unwrap();
+                resolve_role_timing(
+                    &mut role,
+                    true,
+                    ForwardPassWorkerType::Aggregated,
+                    None,
+                    false,
+                    &mut Vec::new(),
+                    &mut serde_json::Map::new(),
+                )
+                .unwrap()
+                .0
+                .unwrap();
+                assert_eq!(role.rank.aic_nextn, Some(2));
+                // The resolved identity keeps the scheme the CPU tier requires.
+                role.rank.validate_host_offload_speculation().unwrap();
+                let TimingModelConfig::External { config, .. } = &role.rank.timing_model else {
+                    panic!("the role keeps its AIC timing");
+                };
+                assert_eq!(config["speculation"]["kind"], "mtp");
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_roles_reject_draft_schemes_before_reading_the_checkpoint() {
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        // Reading this local checkpoint would fail JSON parsing. Unsupported
+        // fitted schemes must instead fail the execution eligibility check.
+        std::fs::write(dir.path().join("config.json"), "invalid checkpoint JSON").unwrap();
+        for mode in [EstimationMode::FpmRegression, EstimationMode::FpmLearned] {
+            let mut value =
+                serde_json::to_value(unknown_regression_identity(ForwardPassWorkerType::Decode))
+                    .unwrap();
+            value["estimation_mode"] = serde_json::to_value(mode).unwrap();
+            value["speculation"] = serde_json::json!({
+                "kind": "draft_model", "params": {"num_speculative_tokens": 2},
+                "draft_model_path": dir.path()
+            });
+            let mut config = serde_json::from_value(value).unwrap();
+            let error = AicTimingModel::build(&mut config, ForwardPassWorkerType::Decode, false)
+                .err()
+                .expect("fitted roles cannot price a draft model");
+            assert!(format!("{error:#}").contains("does not support speculative decoding"));
+        }
+    }
+
+    #[test]
+    fn fitted_mtp_snapshot_load_errors_precede_executor_depth_validation() {
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
+        identity.speculation = Some(
+            serde_json::from_value(serde_json::json!({"kind": "mtp", "params": {"depth": 6}}))
+                .unwrap(),
+        );
+        let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
+        model
+            .tune_with_fpms(&fitted_training_iterations(&[IterationKind::Decode], false))
+            .unwrap();
+        let saved = model
+            .save_state_snapshot(
+                dir.path().join("depth-six"),
+                &crate::StateSnapshotOptions::default(),
+            )
+            .unwrap();
+        let mut role = ReplayRoleConfig::default();
+        role.rank.block_size = 16;
+        role.rank.timing_model = TimingModelConfig::External {
+            provider: "aic".into(),
+            config: serde_json::to_value(saved).unwrap(),
+        };
+        for missing_state in [false, true] {
+            if missing_state {
+                std::fs::remove_file(dir.path().join("depth-six/state.bin")).unwrap();
+            }
+            let error = resolve_role_timing(
+                &mut role.clone(),
+                true,
+                ForwardPassWorkerType::Decode,
+                None,
+                false,
+                &mut Vec::new(),
+                &mut serde_json::Map::new(),
+            )
+            .err()
+            .expect("depth six is valid for cost prediction, but not replay");
+            let error = format!("{error:#}");
+            if missing_state {
+                assert!(error.contains("state.bin"), "{error}");
+                assert!(!error.contains("1..5 draft tokens"), "{error}");
+            } else {
+                assert!(error.contains("1..5 draft tokens"), "{error}");
+            }
+        }
+    }
+
+    #[test]
     fn fitted_aggregated_role_needs_a_locally_mixed_store_only_where_ranks_mix_work() {
         pyo3::prepare_freethreaded_python();
         let dir = tempfile::tempdir().unwrap();
@@ -7871,6 +8198,46 @@ mod tests {
                 mid_chunk_mixed_lengths > 0,
                 "{backend:?} never cut a prompt beside another prefill"
             );
+        }
+    }
+
+    #[test]
+    fn launch_and_fit_must_agree_on_the_cuda_graph_capture_size() {
+        for launch_size in [4096, 512] {
+            let mut role = ReplayRoleConfig::default();
+            role.rank.launch = Some(crate::engine::PassLaunchConfig {
+                decode_ms: 1.0,
+                piecewise_ms: 1.0,
+                eager_ms: 1.0,
+                max_cudagraph_capture_size: launch_size,
+                eager_queue_fraction: 0.0,
+            });
+            role.rank.timing_model = TimingModelConfig::External {
+                provider: "aic".into(),
+                config: serde_json::json!({
+                    "model": "test-model", "backend": "vllm", "system": "test-system", "tp": 1,
+                    "estimator_config": {"fpm_regression": {"fit": {"linear": {
+                        "feature_axes": ["E"], "max_cudagraph_capture_size": 512
+                    }}}}
+                }),
+            };
+            // The test model has no estimator, so equal sizes fail only later.
+            let Err(error) = resolve_role_timing(
+                &mut role,
+                false,
+                ForwardPassWorkerType::Aggregated,
+                None,
+                false,
+                &mut Vec::new(),
+                &mut serde_json::Map::new(),
+            ) else {
+                panic!("the test model cannot build an estimator");
+            };
+            let error = error.to_string();
+            let rejected = error
+                .contains("scheduler.launch.max_cudagraph_capture_size (4096) differs")
+                && error.contains("fit.linear.max_cudagraph_capture_size (512)");
+            assert_eq!(rejected, launch_size != 512, "{error}");
         }
     }
 

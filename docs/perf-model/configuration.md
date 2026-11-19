@@ -285,7 +285,11 @@ total past KV, widens the former and preserves the latter.
 
 The canonical constructor currently supports explicit speculative schemes with
 OP/SOL timing. FPM interpolation and regression are unsupported candidates for
-these schemes. An explicit FPM request with `fallback_policy="deny"` fails;
+these schemes, except that an explicit vLLM `fpm_regression` request prices an
+MTP scheme at the depth it was fitted at (see
+[engine replay timing](#engine-replay-timing)) and is selected as for legacy
+`nextn`. Otherwise an explicit FPM request with
+`fallback_policy="deny"` fails;
 `auto` or an explicit mode with `fallback_policy="allow"` can select a supported
 OP candidate while preserving the complete speculative identity. They do not
 drop speculation to obtain an autoregressive estimate. Separately, an ordinary
@@ -862,7 +866,9 @@ A vLLM regression fitted at `nextn > 0` gives a valid estimate only when its
 training timings cover complete MTP rounds, drafting and verification, as a
 measured speculative-round profile's do; `nextn` records the depth, not how
 the timings were obtained. Replay times such a role only at that depth:
-the snapshot pins `nextn`, and the engine's `aic_nextn` must equal it. Each
+the snapshot pins `nextn`, and the engine's `aic_nextn` must equal it. An MTP
+draft is `depth` extra target-shaped layers, so the snapshot also times an
+engine configured with `speculation: {kind: mtp, params: {depth: N}}`. Each
 decode request counts once in the totals with its past KV, as in the
 telemetry; only its `extend_lengths` entry carries the tokens it verifies: one
 plus the drafts the scheduler gave it, fewer than `nextn` when the token budget
@@ -876,9 +882,10 @@ decode in one rank pass; an SGLang rank runs a prefill batch alone (mixed chunk
 is not modeled), so it does not. Every aggregated worker whose engine runs
 attention DP above one also needs cross-rank aggregated. A regression store is
 ready with a usable fit and a learned store when the forest has it. It rejects
-a rank hosting the vision encoder, a speculation scheme, `nextn > 0` for a
-learned model or a non-vLLM regression (SGLang's telemetry reports an MTP
-decode request's extend as 1), bounded decoder replay, and an automatic selection that
+a rank hosting the vision encoder, a speculation scheme other than MTP,
+`nextn > 0` or MTP for a learned model or a non-vLLM regression (SGLang's
+telemetry reports an MTP decode request's extend as 1), bounded decoder replay,
+and an automatic selection that
 would fall back to an untrained regression. Replay also rejects such a role
 whose engine sets a `decode_speedup_ratio` other than 1: replay then prices
 each rank's phases, which these estimators never do. A pass on which no rank
@@ -1496,7 +1503,8 @@ model, which records no identity; a native snapshot without an enabled, ready
 correction store for the iterations replay prices for the role (prefill, decode,
 or any of prefill, decode and mixed for an aggregated worker); a snapshot
 without `kv_block_size`; one saved for another worker role, model or hardware;
-and snapshots with an FPM profile, speculation, pipeline parallelism (engine
+and snapshots with an FPM profile, speculation other than the vLLM MTP
+regression case below, pipeline parallelism (engine
 replay runs only `pipeline: 1`) or context parallelism.
 `engine.estimator_config.state_snapshot` is rejected: a snapshot belongs to one
 role.
@@ -1544,7 +1552,7 @@ handled as follows:
 | `tp`, `pp`, `attention_dp`, `moe_tp_size` or `moe_ep_size` `unknown` | The role needs one explicit value for each unknown width, such as `parallelism: {preset: false, tensor: 1, pipeline: 1, attention_data: 1}`; known widths are still pinned. `tp * pp * attention_dp` must equal `deployment_limits.num_gpus` when known. |
 | `deployment_limits.max_kv_tokens` | Required. The role's KV capacity is fixed to that many tokens in whole `kv_block_size` blocks and KV memory is not searched; a different fixed capacity or a `memory_fraction` search is a conflict. |
 | `deployment_limits.max_num_batched_tokens`, `max_num_seqs` | Required. The role's `max_batched_tokens` and `max_sequences` domains keep only values at most the recorded limit; an empty domain is an error. |
-| `nextn > 0` | For a vLLM regression, pinned as for a native snapshot: `engine.nextn` takes the saved depth, and `engine.nextn_accepted` is required. Rejected for other backends. |
+| `nextn > 0` or `speculation: {kind: mtp, params: {depth: N}}` | For a vLLM `fpm_regression` snapshot fitted with either spelling, the depth is pinned as for a native snapshot. Replay accepts only 1–5 draft tokens; larger MTP depths remain valid for cost prediction and snapshot restoration, but replay rejects them. Recommendation uses `engine.nextn` and requires `engine.nextn_accepted`; prediction also accepts `engine.speculation: {kind: mtp, params: {depth: N}, expected_accepted_tokens: A}` at the same depth. Rejected for other backends and for `fpm_learned`. |
 
 A snapshot whose `backend_version` is unset (`null`) is rejected: save the
 deployed version or `"unknown"`. `deployment_limits.num_gpus` and
@@ -1566,7 +1574,7 @@ These additional public YAML fields are concrete controls:
 | Field | Meaning |
 | --- | --- |
 | `engine.gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `comm_quant_mode` | Explicit precision overrides; omitted values follow model/profile normalization. AFD resolves GEMM/MoE execution independently against each pool hardware while preserving requested overrides. |
-| `engine.kvcache_quant_mode` | KV storage precision: `bfloat16`, `fp8`, or `int8`. Omission follows model/profile normalization and can select FP8 for quantized checkpoints. |
+| `engine.kvcache_quant_mode` | KV storage precision: `bfloat16`, `fp8`, `int8`, or `nvfp4`. Omission follows model/profile normalization and can select FP8 for quantized checkpoints. |
 | `engine.attention_backend` | Attention kernel selector, including AFD per-pool construction; subject to canonical model/backend validation. |
 | `engine.moe_kernel_source` | Exact collected fused-MoE compute source, including AFD per-pool construction; unsupported with a large-EP MoE graph. |
 | `engine.moe_backend` | Runtime graph/backend selector, subject to canonical validation; nondefault overrides remain unsupported for AFD. |
@@ -1612,9 +1620,10 @@ recorded `kv_cache_dtype`. Otherwise, the first matching rule below applies:
 
 | Checkpoint metadata | Inferred KV precision |
 |---|---|
-| `kv_cache_quant_algo` is not missing/null, `fp8`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
+| `kv_cache_quant_algo`, or a ModelOpt `kv_cache_scheme` string, is not missing/null, `fp8`, `nvfp4`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
+| `kv_cache_quant_algo: nvfp4`, or ModelOpt `kv_cache_scheme: NVFP4` or a 4-bit float scheme (`quant_method: modelopt`) | NVFP4 |
 | DeepSeek V4/V4.1 architecture | FP8 |
-| `kv_cache_quant_algo: fp8` | FP8 |
+| `kv_cache_quant_algo: fp8`, or ModelOpt `kv_cache_scheme: FP8` | FP8 |
 | `kv_cache_quant_algo: "none"` | BF16 |
 | KV declaration missing/null or `bfloat16`; weight `quant_algo` is `fp8`, `fp8_block`, or `nvfp4` | FP8 |
 | Other supported configurations | BF16 |
@@ -1637,6 +1646,15 @@ at compile time and do not report the resolved precision through this path.
 
 FP8 uses one byte per KV element; BF16 uses two. At the same byte budget, linear
 FP8 KV holds twice as many tokens. This does not imply twice the throughput.
+
+NVFP4 uses 9/16 byte per element: 4-bit values plus one FP8 scale per 16, as
+vLLM's `--kv-cache-dtype nvfp4` and TRT-LLM's `kv_cache_config.dtype: nvfp4`
+store K and V. No attention data is collected at NVFP4 KV yet, so op-level
+timing refuses it at construction in `SILICON`, `HYBRID` and `EMPIRICAL` modes,
+and `estimation_mode: auto` moves on to measured FPM data. `SOL` evaluates the
+speed-of-light bound at the NVFP4 width. Models with an MLA latent or compressed
+KV cache (DeepSeek, Kimi K2.5, GLM-5) reject `nvfp4`: vLLM (`nvfp4_ds_mla`) and
+TRT-LLM store FP4 MLA caches in their own layouts, which `nvfp4` does not model.
 
 AFD preserves supported controls, including explicit `attention_backend` and
 `moe_kernel_source`, through prediction, recommendation, saved replay specifications,
