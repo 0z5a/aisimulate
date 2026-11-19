@@ -346,7 +346,7 @@ def test_curl_uses_private_config_without_redirects_or_token_arguments(tmp_path,
     transfer.transfer("https://artifactory.invalid/wheel", token, payload, upload=True, checksum="a" * 64)
 
 
-def test_wheel_handoffs_require_internal_containerized_runners():
+def _wheel_handoff_runner_violations(workflow_root):
     # NVIDIA Artifactory requires internal DNS/network access. Dedicated ARC
     # runners also require a job container; a GitHub-hosted runner cannot
     # consume a handoff just because its manifest is available in Actions.
@@ -356,7 +356,7 @@ def test_wheel_handoffs_require_internal_containerized_runners():
         "prod-aisim-default-${{ matrix.arch }}-v1",
     }
     violations = []
-    for path in (ROOT / ".github/workflows").glob("*.yml"):
+    for path in workflow_root.glob("*.yml"):
         for job_name, job in yaml.safe_load(path.read_text()).get("jobs", {}).items():
             if not any(step.get("uses", "").endswith("/wheel-storage") for step in job.get("steps", [])):
                 continue
@@ -368,9 +368,40 @@ def test_wheel_handoffs_require_internal_containerized_runners():
             )
             if not runners or not runners <= internal_runners:
                 violations.append(f"{path.name}:{job_name} lacks an internal Artifactory runner")
-            if not job.get("container", {}).get("image"):
+            container = job.get("container")
+            image = container if isinstance(container, str) else (container or {}).get("image")
+            if not image:
                 violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
+    return violations
+
+
+def test_wheel_handoffs_require_internal_containerized_runners():
+    violations = _wheel_handoff_runner_violations(ROOT / ".github/workflows")
     assert not violations, "\n".join(violations)
+
+
+@pytest.mark.parametrize("runner", ["prod-aisim-default-amd64-v1", "ubuntu-24.04"])
+@pytest.mark.parametrize(
+    ("container", "has_image"),
+    [
+        ("nvcr.io/fixture/image:1", True),
+        ({"image": "nvcr.io/fixture/image:1", "options": "--ipc=host"}, True),
+        (None, False),
+        ("", False),
+        ({}, False),
+        ({"image": ""}, False),
+        ({"options": "--ipc=host"}, False),
+    ],
+)
+def test_wheel_handoff_policy_checks_both_container_forms(tmp_path, runner, container, has_image):
+    job = {"runs-on": runner, "container": container, "steps": [{"uses": "./.github/actions/wheel-storage"}]}
+    (tmp_path / "fixture.yml").write_text(yaml.safe_dump({"jobs": {"handoff": job}}))
+    expected = []
+    if runner == "ubuntu-24.04":
+        expected.append("fixture.yml:handoff lacks an internal Artifactory runner")
+    if not has_image:
+        expected.append("fixture.yml:handoff lacks the required ARC job container")
+    assert _wheel_handoff_runner_violations(tmp_path) == expected
 
 
 def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary():
